@@ -21,6 +21,7 @@ import { issueWsCsrfToken, isCsrfEnabled } from '../infrastructure/csrf';
 import { config } from '../infrastructure/config';
 import { ok, okCached, fail } from '../infrastructure/response';
 import { sendError } from '../infrastructure/error';
+import { getConsistencyObjective, evaluateConsistency } from './consistency-objectives';
 
 const router = Router();
 let pricesCache: HybridCache<unknown>;
@@ -128,6 +129,7 @@ router.get('/prices', async (req: Request, res: Response) => {
   const data = withLinks(
     {
       ...aggregated,
+      consistency: evaluateConsistency('live-prices', aggregated.timestamp),
       prices: aggregated.prices.map((price) => ({
         ...price,
         lineage: createLineageForPrice(price as unknown as Record<string, unknown>, '/api/v1'),
@@ -176,6 +178,7 @@ router.get('/prices/:asset', async (req: Request, res: Response) => {
   const data = withLinks(
     {
     ...price,
+    consistency: evaluateConsistency('live-prices', price.timestamp),
     lineage: createLineageForPrice(price as unknown as Record<string, unknown>, '/api/v1'),
     },
     links.asset(asset),
@@ -225,6 +228,7 @@ router.get('/history/:asset', async (req: Request, res: Response) => {
   const response = {
     asset: upperAsset,
     to: to || null,
+    consistency: evaluateConsistency('history', page.length > 0 ? page[0].timestamp : undefined),
     prices: page,
     pagination,
   };
@@ -272,6 +276,7 @@ router.get('/history/:asset/legacy', async (req: Request, res: Response) => {
     from: from || null,
     to: to || null,
     count: history.length,
+    consistency: evaluateConsistency('history', history.length > 0 ? history[0].timestamp : undefined),
     prices: history,
   };
 
@@ -303,7 +308,11 @@ router.get('/sources', async (req: Request, res: Response) => {
   ];
 
   const { items: sources, meta: pagination } = applyOffsetPagination(allSources, page, limit);
-  const data = { sources, pagination };
+  const data = {
+    sources,
+    pagination,
+    consistency: evaluateConsistency('catalog', Math.floor(Date.now() / 1000)),
+  };
 
   await pricesCache.set(cacheKey, data, 'sources');
   res.json(ok(data));
@@ -344,6 +353,13 @@ router.get('/health', async (req: Request, res: Response) => {
     timestamp: Math.floor(Date.now() / 1000),
     assetsTracked: prices.length,
     degradedAssets: prices.filter((p) => Date.now() / 1000 - p.timestamp > 120).map((p) => p.asset),
+    consistency: evaluateConsistency('live-prices', Math.floor(Date.now() / 1000)),
+    objectives: {
+      livePrices: getConsistencyObjective('live-prices'),
+      history: getConsistencyObjective('history'),
+      catalog: getConsistencyObjective('catalog'),
+      analytics: getConsistencyObjective('analytics'),
+    },
     endpoints: {
       liveness: '/api/v1/health/live',
       readiness: '/api/v1/health/ready',
