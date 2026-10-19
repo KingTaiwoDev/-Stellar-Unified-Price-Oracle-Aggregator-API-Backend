@@ -13,6 +13,49 @@ function deriveSourceHosts(urls: string[]): string[] {
   return Array.from(hosts);
 }
 
+export interface FeedOwnership {
+  primary: string;
+  failover: string;
+}
+
+function buildFeedOwnership(
+  parsed: ReturnType<typeof parseConfigEnv>,
+  regionId: string,
+): Record<string, FeedOwnership> {
+  const ownership: Record<string, FeedOwnership> = {};
+
+  // Lowest precedence: per-asset env vars.
+  for (const asset of parsed.WATCHED_ASSETS) {
+    const key = asset.toUpperCase().replace(/[^A-Z0-9]/g, '_');
+    const primary = parsed.FEED_PRIMARY_REGION[asset] ?? parsed.FEED_PRIMARY_REGION[key];
+    const failover = parsed.FEED_FAILOVER_REGION[asset] ?? parsed.FEED_FAILOVER_REGION[key];
+    if (primary || failover) {
+      ownership[asset] = {
+        primary: (primary ?? regionId).toLowerCase(),
+        failover: (failover ?? primary ?? regionId).toLowerCase(),
+      };
+    }
+  }
+
+  // Highest precedence: explicit JSON map.
+  for (const [asset, entry] of Object.entries(parsed.FEED_OWNERSHIP_JSON)) {
+    ownership[asset] = {
+      primary: (entry.primary ?? regionId).toLowerCase(),
+      failover: (entry.failover ?? entry.primary ?? regionId).toLowerCase(),
+    };
+  }
+
+  // Default any unconfigured asset to the local region for both roles so every
+  // feed always has exactly one authorized publisher.
+  for (const asset of parsed.WATCHED_ASSETS) {
+    if (!ownership[asset]) {
+      ownership[asset] = { primary: regionId.toLowerCase(), failover: regionId.toLowerCase() };
+    }
+  }
+
+  return ownership;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
   const parsed = parseConfigEnv(env);
 
@@ -65,6 +108,33 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       quarantineRecoverPercent: parsed.REGION_QUARANTINE_RECOVER_PERCENT,
       maxReplicationLagMs: parsed.REGION_MAX_REPLICATION_LAG_MS,
     },
+
+    // Issue #736 — deployment cells. A cell is the blast-radius boundary for a
+    // single deployment or dependency failure: only the feeds assigned to the
+    // cell (and their consumers) are affected. Configure with:
+    //   CELL_ID                  unique id of this cell (defaults to region id)
+    //   CELL_ASSIGNED_FEEDS      comma-separated assets owned by this cell
+    //                            (defaults to WATCHED_ASSETS)
+    //   CELL_DEPENDENCY_ENDPOINTS comma-separated dependency endpoints
+    //                            (defaults to the configured source base URLs)
+    cell: {
+      id: parsed.CELL_ID ?? regionId,
+      assignedFeeds: parsed.CELL_ASSIGNED_FEEDS.length > 0
+        ? parsed.CELL_ASSIGNED_FEEDS
+        : parsed.WATCHED_ASSETS,
+      dependencyEndpoints: parsed.CELL_DEPENDENCY_ENDPOINTS.length > 0
+        ? parsed.CELL_DEPENDENCY_ENDPOINTS
+        : sourceUrls,
+    },
+
+    // Issue #737 — explicit per-feed primary/failover region ownership.
+    // Sources, in order of precedence:
+    //   FEED_OWNERSHIP_JSON={"XLM":{"primary":"us-east-1","failover":"eu-west-1"}}
+    //   FEED_PRIMARY_REGION_<ASSET> / FEED_FAILOVER_REGION_<ASSET>
+    //     (e.g. FEED_PRIMARY_REGION_XLM, FEED_FAILOVER_REGION_XLM)
+    // Assets without an explicit entry fall back to the local region for both
+    // primary and failover so a single authorized publisher is always defined.
+    feedOwnership: buildFeedOwnership(parsed, regionId),
   },
 
   assets: (process.env.WATCHED_ASSETS || 'XLM,USDC,BTC,ETH,USDT').split(','),

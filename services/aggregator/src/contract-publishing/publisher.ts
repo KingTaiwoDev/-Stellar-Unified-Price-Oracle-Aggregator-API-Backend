@@ -32,6 +32,10 @@ import { AggregatedPrice } from '../infrastructure/types';
 import { CanaryRollbackGuard, shouldRouteToCanary } from './canary';
 import { SubmissionRetryQueue } from './retry-queue';
 import { MerkleTree, BatchPriceEntry } from '../infrastructure/merkle';
+import {
+  FeedOwnershipRegistry,
+  OwnershipDecision,
+} from './feed-ownership';
 
 interface ContractCallLog {
   txHash: string;
@@ -258,13 +262,20 @@ export class ContractPublisher {
   private submissionSequence = 0;
   private canaryRollbackGuard: CanaryRollbackGuard;
 
-  constructor(feePolicy: Partial<FeePolicy> = {}) {
+  // Feed ownership / regional failover state (Issues #737, #738)
+  private ownershipRegistry: FeedOwnershipRegistry | null = null;
+
+  constructor(
+    feePolicy: Partial<FeePolicy> = {},
+    ownershipRegistry: FeedOwnershipRegistry | null = null,
+  ) {
     this.server = new SorobanRpc.Server(config.soroban.rpcUrl);
     this.keypair = Keypair.fromSecret(config.soroban.adminSecret);
     this.contractId = config.soroban.contractId;
     this.networkPassphrase = config.soroban.networkPassphrase;
     this.feePolicy = { ...DEFAULT_FEE_POLICY, ...feePolicy };
     this.canaryRollbackGuard = new CanaryRollbackGuard(config.canary.failureThreshold);
+    this.ownershipRegistry = ownershipRegistry;
 
     this.retryQueue = new SubmissionRetryQueue({
       maxRetries: 5,
@@ -292,6 +303,49 @@ export class ContractPublisher {
 
   isPublishingEnabled(): boolean {
     return this.publishingEnabled;
+  }
+
+  /**
+   * Issues #737, #738 — attach (or replace) the feed ownership registry used
+   * to gate submissions. When no registry is configured the publisher keeps
+   * its legacy behaviour and publishes unconditionally.
+   */
+  setOwnershipRegistry(registry: FeedOwnershipRegistry | null): void {
+    this.ownershipRegistry = registry;
+  }
+
+  /**
+   * Issues #737, #738 — decide whether this region may publish the given feed
+   * right now. Returns `{ allowed: true }` when no registry is configured.
+   *
+   * A feed is publishable only when:
+   *   - this region is the current owner, and
+   *   - the local epoch matches the latest committed epoch, and
+   *   - no authority transfer (failover/failback) is in progress.
+   */
+  private checkFeedAuthority(asset: string): OwnershipDecision {
+    if (!this.ownershipRegistry) {
+      return { allowed: true };
+    }
+    return this.ownershipRegistry.canPublish(asset);
+  }
+
+  /**
+   * Issues #737, #738 — log and drop a submission that this region is not
+   * authorized to make. Never enqueues a retry: the owning region is
+   * responsible for the feed, and retrying here would risk split brain.
+   */
+  private rejectUnauthorizedSubmission(asset: string, decision: OwnershipDecision): null {
+    logger.warn('[Publisher] Skipping submission: region not authorized for feed', {
+      asset,
+      region: this.ownershipRegistry?.getLocalRegion(),
+      reason: decision.reason,
+      ownerRegion: decision.ownerRegion,
+      localEpoch: decision.localEpoch,
+      latestEpoch: decision.latestEpoch,
+      transferInProgress: decision.transferInProgress,
+    });
+    return null;
   }
 
   /**
@@ -385,6 +439,12 @@ export class ContractPublisher {
     timestamp: number,
     isRetry = false,
   ): Promise<string | null> {
+    // Issues #737, #738 — enforce single authorized publisher per feed.
+    const authority = this.checkFeedAuthority(asset);
+    if (!authority.allowed) {
+      return this.rejectUnauthorizedSubmission(asset, authority);
+    }
+
     const startMs = Date.now();
     const fnName = 'submit_price';
     const params = { asset, price: price.toString(), decimals, timestamp };
@@ -871,6 +931,13 @@ export class ContractPublisher {
     // Fallback: per-asset submit_price (original behaviour).
     logger.warn('[Publisher] Batch path failed or unavailable, falling back to per-asset submission');
     for (const price of prices) {
+      // Issues #737, #738 — skip feeds owned by another region or mid-transfer.
+      const authority = this.checkFeedAuthority(price.asset);
+      if (!authority.allowed) {
+        this.rejectUnauthorizedSubmission(price.asset, authority);
+        continue;
+      }
+
       this.submissionSequence += 1;
       const routeToCanary =
         this.isCanaryActive() &&
@@ -934,6 +1001,16 @@ export class ContractPublisher {
   // practice, but the caller must be aware of it for partial-failure cases.
   private async publishViaBatch(prices: AggregatedPrice[]): Promise<boolean> {
     if (prices.length === 0) return true;
+
+    // Issues #737, #738 — filter out feeds this region is not authorized to
+    // publish. If nothing remains, the round is a no-op (return true so the
+    // caller does not fall back to per-asset submission).
+    const authorizedPrices = this.filterAuthorizedPrices(prices);
+    if (authorizedPrices.length === 0) {
+      logger.debug('[Publisher/Batch] No feeds authorized for this region in this round');
+      return true;
+    }
+    prices = authorizedPrices;
 
     try {
       // Step 1: read current nonce.
@@ -999,6 +1076,24 @@ export class ContractPublisher {
       });
       return false;
     }
+  }
+
+  /**
+   * Issues #737, #738 — return only the prices whose feeds this region is
+   * currently authorized to publish, logging each rejected feed.
+   */
+  private filterAuthorizedPrices(prices: AggregatedPrice[]): AggregatedPrice[] {
+    if (!this.ownershipRegistry) return prices;
+    const authorized: AggregatedPrice[] = [];
+    for (const price of prices) {
+      const decision = this.checkFeedAuthority(price.asset);
+      if (decision.allowed) {
+        authorized.push(price);
+      } else {
+        this.rejectUnauthorizedSubmission(price.asset, decision);
+      }
+    }
+    return authorized;
   }
 
   private async getBatchNonce(): Promise<bigint | null> {
@@ -1153,6 +1248,13 @@ export class ContractPublisher {
     if (!this.publishingEnabled) return;
     const items = this.retryQueue.getQueueItems();
     for (const item of items) {
+      // Issues #737, #738 — never retry a feed this region no longer owns.
+      const authority = this.checkFeedAuthority(item.asset);
+      if (!authority.allowed) {
+        this.rejectUnauthorizedSubmission(item.asset, authority);
+        this.retryQueue.remove(`${item.asset}:${item.timestamp}`);
+        continue;
+      }
       this.submitPrice(item.asset, item.price, item.decimals, item.timestamp)
         .then((result) => {
           if (result) {
@@ -1194,6 +1296,13 @@ export class ContractPublisher {
       logger.info(`[Publisher] Draining ${items.length} item(s) from retry queue before exit...`);
       for (const item of items) {
         if (!this.publishingEnabled) break;
+        // Issues #737, #738 — drop items for feeds owned by another region.
+        const authority = this.checkFeedAuthority(item.asset);
+        if (!authority.allowed) {
+          this.rejectUnauthorizedSubmission(item.asset, authority);
+          this.retryQueue.remove(`${item.asset}:${item.timestamp}`);
+          continue;
+        }
         try {
           const result = await this.submitPrice(item.asset, item.price, item.decimals, item.timestamp);
           if (result) {

@@ -24,6 +24,8 @@ import {
   regionDriftPercent,
   regionPeersConfigured,
   regionPeersReporting,
+  cellFeedsAssigned,
+  cellDependencyEndpointInfo,
 } from './observability/metrics';
 import { DatabaseClient } from './persistence/database';
 import { BaseSource } from './oracle-sources/base';
@@ -41,6 +43,11 @@ import {
   setAllowedAssets,
   setAllowedSources,
 } from './observability/cardinality';
+import {
+  resolveCellTopology,
+  CellTopologyError,
+  type CellTopology,
+} from './infrastructure/cell-topology';
 
 // In-process counters surfaced as structured log lines; the API /metrics
 // endpoint (prom-client) collects the canonical Prometheus metrics.
@@ -57,6 +64,21 @@ function incPriceUpdate(asset: string, source: string): void {
 function incAnomaly(asset: string, method: string): void {
   const key = `${asset}:${method}`;
   internalCounters.anomalies.set(key, (internalCounters.anomalies.get(key) ?? 0) + 1);
+}
+
+// Issue #736 — cell topology resolved once at module load so that feed
+// partitioning, dependency routing and per-cell health/metrics all agree on
+// the same cell assignment. A duplicate-feed claim is fatal (see main()).
+let cellTopology: CellTopology | null = null;
+let cellTopologyError: CellTopologyError | null = null;
+try {
+  cellTopology = resolveCellTopology(config);
+} catch (err) {
+  if (err instanceof CellTopologyError) {
+    cellTopologyError = err;
+  } else {
+    throw err;
+  }
 }
 
 const aggregator = new PriceAggregator();
@@ -92,8 +114,13 @@ async function poll(): Promise<AggregatedPrice[]> {
   const sourcePricesByAsset: Map<string, { source: string; price: string }[]> = new Map();
   const sourceFetchStarted = performance.now();
 
+  // Issue #736 — only poll the feeds assigned to this deployment's cell. A
+  // failure in this cell's dependencies therefore cannot stall feeds owned by
+  // other cells, and vice versa.
+  const cellAssets = cellTopology ? cellTopology.assets : config.assets;
+
   for (const source of sources) {
-    const prices = await source.fetchAll(config.assets);
+    const prices = await source.fetchAll(cellAssets);
     for (const price of prices) {
       // Publish PriceFetchedEvent
       eventBus.publish({
@@ -268,7 +295,7 @@ async function poll(): Promise<AggregatedPrice[]> {
     // Issue #382 — on-chain price staleness heartbeat: detect when the
     // contract itself stops receiving submissions, independent of whether
     // this aggregator process looks healthy.
-    for (const asset of config.assets) {
+    for (const asset of cellTopology ? cellTopology.assets : config.assets) {
       const onChainTimestamp = await publisher.getOnChainTimestamp(asset);
       if (onChainTimestamp === null) continue;
 
@@ -299,19 +326,38 @@ async function poll(): Promise<AggregatedPrice[]> {
 
 async function main(): Promise<void> {
   logger.info('Stellar Price Oracle Aggregator starting...');
+
+  // Issue #736 — refuse to start if two cells claim the same feed. Overlapping
+  // ownership would let one cell's failure bleed into another's feeds.
+  if (cellTopologyError || !cellTopology) {
+    logger.error('Cell topology is invalid; refusing to start', {
+      error: cellTopologyError?.message ?? 'cell topology not resolved',
+      duplicates: cellTopologyError?.duplicates ?? [],
+    });
+    process.exit(1);
+  }
+
+  logger.info('Cell topology resolved', {
+    cellId: cellTopology.cellId,
+    assets: cellTopology.assets,
+    dependencies: cellTopology.dependencies,
+    cells: cellTopology.cells.map((c) => ({ cellId: c.cellId, assets: c.assets })),
+  });
+
   logger.info(`Polling interval: ${config.pollingIntervalMs}ms`);
-  logger.info(`Watched assets: ${config.assets.join(', ')}`);
+  logger.info(`Watched assets (cell ${cellTopology.cellId}): ${cellTopology.assets.join(', ')}`);
   logger.info(
     'Resolved configuration (redacted)',
     redactedConfigView(config) as Record<string, unknown>,
   );
 
   // Enforce Prometheus cardinality budget for configured sources and assets (#553)
-  enforceStartupCardinalityBudget(['chainlink', 'redstone', 'band', 'reflector'], config.assets);
-  setAllowedAssets(config.assets);
+  // Issue #736 — scope the budget to this cell's feeds only.
+  enforceStartupCardinalityBudget(['chainlink', 'redstone', 'band', 'reflector'], cellTopology.assets);
+  setAllowedAssets(cellTopology.assets);
   setAllowedSources(['chainlink', 'redstone', 'band', 'reflector']);
 
-  for (const asset of config.assets) {
+  for (const asset of cellTopology.assets) {
     anomalyDetector.applyRuntimeConfig(asset);
     const summary = anomalyDetector.getConfigSummary(asset);
     logger.info(`[AnomalyConfig] ${asset}: zscore=${summary.config.zScoreThreshold}, deviation=${summary.config.movingAverageDeviationPercent}%, volatility=${summary.config.volatilityMultiplier}, false_positive_rate=${summary.falsePositiveRate.toFixed(3)}`);
@@ -365,11 +411,13 @@ async function main(): Promise<void> {
   const wss = new WebSocketServer(config.port);
   wss.start();
 
+  // Issue #736 — route each source through this cell's dependency endpoints so
+  // a dependency outage is confined to the cell that depends on it.
   const persistentSources = {
-    chainlink: new ChainlinkSource(),
-    redstone: new RedstoneSource(),
-    band: new BandSource(),
-    reflector: new ReflectorSource(),
+    chainlink: new ChainlinkSource({ endpoint: cellTopology.dependencies.chainlink }),
+    redstone: new RedstoneSource({ endpoint: cellTopology.dependencies.redstone }),
+    band: new BandSource({ endpoint: cellTopology.dependencies.band }),
+    reflector: new ReflectorSource({ endpoint: cellTopology.dependencies.reflector }),
   };
   pollSources = Object.values(persistentSources);
 
@@ -394,6 +442,13 @@ async function main(): Promise<void> {
     lastAggregated,
     replicatedPrices: regionReplicator.getLatestPrices(),
     region: regionQuarantine.getStatus(),
+    // Issue #736 — per-cell health so operators can see which cell owns which
+    // feeds and whether this cell's dependencies are degraded.
+    cell: {
+      cellId: cellTopology.cellId,
+      assets: cellTopology.assets,
+      dependencies: cellTopology.dependencies,
+    },
     circuitBreakerMetrics: aggregator.getCircuitBreakerMetrics(),
     circuitBreakerStates: sourceCircuitBreaker.getAllStatuses(),
     uptime: process.uptime(),
@@ -408,6 +463,11 @@ async function main(): Promise<void> {
   );
 
   regionPeersConfigured.set({ region: config.region.id }, config.region.peers.length);
+  // Issue #736 — per-cell metrics: feed ownership and dependency endpoints.
+  cellFeedsAssigned.set({ cell: cellTopology.cellId }, cellTopology.assets.length);
+  for (const [source, endpoint] of Object.entries(cellTopology.dependencies)) {
+    cellDependencyEndpointInfo.set({ cell: cellTopology.cellId, source }, endpoint);
+  }
   if (config.region.activeActive && config.kafka.brokers.length > 0) {
     replicationPublisher = new KafkaReplicator(
       {

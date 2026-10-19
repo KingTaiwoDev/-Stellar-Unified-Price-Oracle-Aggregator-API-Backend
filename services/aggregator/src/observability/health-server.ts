@@ -14,6 +14,26 @@ export interface CircuitBreakerMetrics {
   suspiciousSourcesList: Array<{ key: string; deviations: number }>;
 }
 
+// #736 — a deployment cell bounds the blast radius of a single deployment or
+// dependency failure to a fixed set of feeds and consumers.
+export interface CellStatus {
+  id: string;
+  feeds: string[];
+  dependencies: Record<string, boolean>;
+  degraded: boolean;
+  reason?: string;
+}
+
+// #737 — explicit per-feed ownership: primary/failover region and the epoch of
+// the single authorized publisher.
+export interface FeedOwnership {
+  feed: string;
+  primaryRegion: string;
+  failoverRegion: string;
+  ownerRegion: string;
+  publisherEpoch: number;
+}
+
 export interface HealthSnapshot {
   sourceHealth: Record<string, SourceHealthStatus>;
   lastAggregated: AggregatedPrice[];
@@ -27,6 +47,10 @@ export interface HealthSnapshot {
   onChainHeartbeat?: Record<string, number>;
   // Issue #590 — resolved listen ports (PORT base, PORT+1 WS, PORT+2 HTTP).
   ports?: { base: number; ws: number; http: number };
+  // #736 — cell boundaries and their dependency reachability.
+  cells?: CellStatus[];
+  // #737 — per-feed owner region and current publisher epoch.
+  feedOwnership?: FeedOwnership[];
 }
 
 export class HealthServer {
@@ -74,7 +98,15 @@ export class HealthServer {
         const hasPrices = snap.lastAggregated.length > 0;
         const quarantined = snap.region?.quarantined === true;
         const shuttingDown = snap.shutdownInProgress === true;
-        const ready = hasPrices && !quarantined && !shuttingDown && openCircuits.length < Object.keys(snap.sourceHealth).length;
+        const globalReady = hasPrices && !quarantined && !shuttingDown && openCircuits.length < Object.keys(snap.sourceHealth).length;
+
+        // #736 — cell-scoped readiness. A degraded cell only affects its own
+        // feeds; the deployment is ready as long as at least one cell is healthy.
+        const cells = snap.cells ?? [];
+        const cellReadiness = cells.map((c) => ({ id: c.id, ready: !c.degraded, reason: c.reason }));
+        const anyCellReady = cells.length === 0 ? globalReady : cells.some((c) => !c.degraded);
+        const ready = globalReady && anyCellReady;
+
         const code = ready ? 200 : 503;
         res.writeHead(code, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
@@ -84,7 +116,23 @@ export class HealthServer {
           shutdownInProgress: shuttingDown,
           startupTimeMs: snap.startupTimeMs ?? 0,
           openCircuitBreakers: openCircuits.length,
+          cells: cellReadiness,
         }));
+        return;
+      }
+
+      // #736 — cell boundaries, assigned feeds and dependency reachability.
+      if (url.pathname === '/health/cells') {
+        const snap = this.getSnapshot();
+        const cells = (snap.cells ?? []).map((c) => ({
+          id: c.id,
+          feeds: c.feeds,
+          dependencies: c.dependencies,
+          degraded: c.degraded,
+          reason: c.reason,
+        }));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ cells }));
         return;
       }
 
@@ -166,6 +214,15 @@ export class HealthServer {
           onChainHeartbeat: snap.onChainHeartbeat || {},
           // #590 — resolved listen ports, so drift is visible at runtime
           ...(snap.ports ? { ports: snap.ports } : {}),
+          // #736 — cell-scoped health so one cell's failure is visible in isolation
+          cells: (snap.cells ?? []).map((c) => ({
+            id: c.id,
+            feeds: c.feeds,
+            degraded: c.degraded,
+            reason: c.reason,
+          })),
+          // #737 — per-feed owner region and publisher epoch
+          feedOwnership: snap.feedOwnership ?? [],
         };
 
         if (verbose) {

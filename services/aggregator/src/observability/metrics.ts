@@ -321,5 +321,68 @@ export const historyFileWriteFailuresTotal = new client.Counter({
   registers: [register],
 });
 
+// Issue #736 — deployment cell isolation.
+// Each cell is a bounded blast radius: a failure in one cell must not affect
+// feeds or consumers assigned to other cells. cell_health is 1 when the cell
+// is serving normally and 0 when it is degraded or isolated.
+export const cellHealth = new client.Gauge({
+  name: 'cell_health',
+  help: 'Cell health: 1 when the cell is serving normally, 0 when degraded or isolated',
+  labelNames: ['cell'],
+  registers: [register],
+});
+
+export const cellAssignedFeeds = new client.Gauge({
+  name: 'cell_assigned_feeds',
+  help: 'Number of feeds currently assigned to the cell',
+  labelNames: ['cell'],
+  registers: [register],
+});
+
+// Per-dependency health within a cell so a single dependency failure can be
+// attributed to the cells that actually depend on it.
+export const cellDependencyUp = new client.Gauge({
+  name: 'cell_dependency_up',
+  help: 'Dependency reachability from a cell: 1 when up, 0 when down',
+  labelNames: ['cell', 'dependency'],
+  registers: [register],
+});
+
+// Issue #737 — feed ownership and regional failover.
+// feed_owner_region is 1 for the region that currently owns the feed and 0
+// for all other regions, so exactly one owner is observable per feed.
+export const feedOwnerRegion = new client.Gauge({
+  name: 'feed_owner_region',
+  help: 'Feed ownership by region: 1 for the current owner region, 0 otherwise',
+  labelNames: ['feed', 'region'],
+  registers: [register],
+});
+
+// Monotonically increasing publisher epoch per feed. Every ownership
+// transition must bump the epoch so a stale publisher is detectable.
+export const feedPublisherEpoch = new client.Gauge({
+  name: 'feed_publisher_epoch',
+  help: 'Current publisher epoch for the feed; incremented on every ownership transition',
+  labelNames: ['feed'],
+  registers: [register],
+});
+
+// Issue #738 — automated controlled failback.
+// failback_state encodes the failback phase per feed:
+// 0=idle, 1=waiting_for_stability, 2=reconciling, 3=transferring, 4=complete, 5=aborted.
+export const failbackState = new client.Gauge({
+  name: 'failback_state',
+  help: 'Failback phase per feed (0=idle,1=waiting_for_stability,2=reconciling,3=transferring,4=complete,5=aborted)',
+  labelNames: ['feed'],
+  registers: [register],
+});
+
+export const failbackStabilitySeconds = new client.Gauge({
+  name: 'failback_stability_seconds',
+  help: 'Seconds the primary region has been continuously healthy while failback waits for stability',
+  labelNames: ['feed'],
+  registers: [register],
+});
+
 export { register };
 

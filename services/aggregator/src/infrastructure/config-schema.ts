@@ -224,7 +224,97 @@ const envShape = {
     REGION_QUARANTINE_RECOVER_PERCENT: floatVar(0.05, 0, 100),
     REGION_MAX_REPLICATION_LAG_MS: intVar(5000, 1, 600_000),
 
+    CELL_ID: z
+      .string()
+      .optional()
+      .transform((raw, ctx) => {
+        if (raw === undefined || raw.trim() === '') return undefined;
+        const value = raw.trim().toLowerCase();
+        if (!REGION_ID.test(value)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `"${raw}" is not a valid cell id (lowercase letters, digits and dashes)`,
+          });
+          return z.NEVER;
+        }
+        return value;
+      }),
+    CELL_ASSIGNED_FEEDS: commaListSchema(
+      'CELL_ASSIGNED_FEEDS',
+      (entry) => ASSET_SYMBOL.test(entry.toUpperCase()),
+      'expected an asset symbol (A-Z 0-9 : _ -, max 32 chars)',
+    ),
+    CELL_DB_URL: z
+      .string()
+      .optional()
+      .transform((raw, ctx) => {
+        if (raw === undefined || raw.trim() === '') return undefined;
+        const value = raw.trim();
+        if (!/^postgres(ql)?:\/\/\S+$/.test(value)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: 'expected a postgres:// or postgresql:// connection URL',
+          });
+          return z.NEVER;
+        }
+        return value;
+      }),
+    CELL_CACHE_URL: z
+      .string()
+      .optional()
+      .transform((raw, ctx) => {
+        if (raw === undefined || raw.trim() === '') return undefined;
+        const value = raw.trim();
+        if (!/^(redis|rediss|memcached):\/\/\S+$/.test(value)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: 'expected a redis://, rediss:// or memcached:// URL',
+          });
+          return z.NEVER;
+        }
+        return value;
+      }),
+    CELL_PROVIDER_URLS: commaListSchema(
+      'CELL_PROVIDER_URLS',
+      (entry) => isHttpUrl(entry),
+      'expected an absolute http(s) URL',
+    ),
+
     KAFKA_BROKERS: commaListSchema(
+======>>> REPLACE
+<<<<<<< SEARCH
+export type RawEnvConfig = z.infer<typeof envSchema>;
+=======
+export type RawEnvConfig = z.infer<typeof envSchema>;
+
+export interface CellConfig {
+  /** Cell identifier; `default` preserves single-cell behaviour. */
+  id: string;
+  /** True when CELL_ID was not set and the service runs as the single default cell. */
+  isDefault: boolean;
+  /** Upper-cased asset symbols owned by this cell (empty means all watched assets). */
+  assignedFeeds: string[];
+  /** Per-cell dependency overrides; undefined falls back to the global setting. */
+  dbUrl?: string;
+  cacheUrl?: string;
+  providerUrls: string[];
+}
+
+export const DEFAULT_CELL_ID = 'default';
+
+export function resolveCellConfig(config: RawEnvConfig): CellConfig {
+  const isDefault = config.CELL_ID === undefined;
+  return {
+    id: config.CELL_ID ?? DEFAULT_CELL_ID,
+    isDefault,
+    assignedFeeds: Array.from(
+      new Set((config.CELL_ASSIGNED_FEEDS ?? []).map((feed) => feed.toUpperCase())),
+    ),
+    dbUrl: config.CELL_DB_URL,
+    cacheUrl: config.CELL_CACHE_URL,
+    providerUrls: config.CELL_PROVIDER_URLS ?? [],
+  };
+}
       'KAFKA_BROKERS',
       (entry) => entry.length > 0 && entry.length <= 253 && !/\s/.test(entry),
       'expected a bootstrap broker as host or host:port',
@@ -318,6 +408,35 @@ const envSchema = z.object(envShape).superRefine((value, ctx) => {
         `must be <= REGION_DRIFT_ALERT_PERCENT (${value.REGION_DRIFT_ALERT_PERCENT}) ` +
         'otherwise a quarantined region can never recover',
     });
+  }
+
+  const hasCellOverrides =
+    value.CELL_DB_URL !== undefined ||
+    value.CELL_CACHE_URL !== undefined ||
+    (value.CELL_PROVIDER_URLS !== undefined && value.CELL_PROVIDER_URLS.length > 0);
+
+  if (value.CELL_ID === undefined) {
+    if (hasCellOverrides || (value.CELL_ASSIGNED_FEEDS?.length ?? 0) > 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['CELL_ID'],
+        message:
+          'must be set when CELL_ASSIGNED_FEEDS, CELL_DB_URL, CELL_CACHE_URL or ' +
+          'CELL_PROVIDER_URLS are provided (cell overrides require an explicit cell id)',
+      });
+    }
+    return;
+  }
+
+  const watched = new Set(value.WATCHED_ASSETS);
+  for (const feed of value.CELL_ASSIGNED_FEEDS ?? []) {
+    if (!watched.has(feed.toUpperCase())) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['CELL_ASSIGNED_FEEDS'],
+        message: `feed "${feed}" is not present in WATCHED_ASSETS`,
+      });
+    }
   }
 });
 
