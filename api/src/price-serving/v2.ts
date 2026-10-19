@@ -8,6 +8,8 @@ import { cacheHitTotal, cacheMissTotal, lastPriceTimestamp, priceQueriesTotal } 
 import { v2Ok, v2Fail } from '../infrastructure/response';
 import { sendError } from '../infrastructure/error';
 import { apiKeyManager } from '../governance/api-key-manager';
+import { buildPriceProvenance } from './consumer/price-provenance';
+import { latencyFreshnessMiddleware } from './consumer/latency-freshness';
 
 type PriceConfidence = 'high' | 'medium' | 'low';
 
@@ -31,6 +33,8 @@ export function initializeCacheV2(cache: HybridCache<unknown>): void {
 }
 
 const BATCH_MAX_ASSETS = 50;
+
+router.use(['/prices', '/prices/:asset'], latencyFreshnessMiddleware());
 
 const BatchQuerySchema = z.object({
   assets: z
@@ -237,6 +241,37 @@ router.get('/prices/:asset', async (req: Request, res: Response) => {
 
   await pricesCache.set(cacheKey, enriched, 'price');
   res.json(v2Ok(enriched));
+});
+
+// GET /prices/:asset/provenance — price-provenance response (#718)
+// Links a price to its catalog version, aggregation policy, source set, and
+// observation-time semantics.
+router.get('/prices/:asset/provenance', async (req: Request, res: Response) => {
+  const asset = req.params.asset.toUpperCase();
+
+  const prices = await readAssetPrices();
+  const price = prices.find((p) => p.asset === asset);
+
+  if (!price) {
+    return res.status(404).json(
+      v2Fail({ code: 'NOT_FOUND', message: `No price data found for asset: ${asset}` }),
+    );
+  }
+
+  const provenance = buildPriceProvenance(
+    {
+      asset: price.asset,
+      price: price.price,
+      decimals: price.decimals,
+      sources: price.sources,
+      timestamp: price.timestamp,
+      observedAt: price.observedAt,
+      fetchedAt: price.fetchedAt,
+    },
+    '/api/v2',
+  );
+
+  res.json(v2Ok(provenance));
 });
 
 router.post('/prices/batch', async (req: Request, res: Response) => {
