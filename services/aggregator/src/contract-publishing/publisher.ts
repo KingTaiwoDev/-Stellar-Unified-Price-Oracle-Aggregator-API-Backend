@@ -32,6 +32,12 @@ import { AggregatedPrice } from '../infrastructure/types';
 import { CanaryRollbackGuard, shouldRouteToCanary } from './canary';
 import { SubmissionRetryQueue } from './retry-queue';
 import { MerkleTree, BatchPriceEntry } from '../infrastructure/merkle';
+import {
+  BrownoutController,
+  BrownoutTier,
+  BrownoutWorkClass,
+  defaultBrownoutController,
+} from './brownout';
 
 interface ContractCallLog {
   txHash: string;
@@ -258,13 +264,23 @@ export class ContractPublisher {
   private submissionSequence = 0;
   private canaryRollbackGuard: CanaryRollbackGuard;
 
-  constructor(feePolicy: Partial<FeePolicy> = {}) {
+  // Issue #741 — brownout gating for non-critical publication work.
+  private brownout: BrownoutController;
+
+  // Issue #742 — publisher fencing state used by the maintenance-window
+  // orchestrator. While fenced, no new contract writes are started and the
+  // retry queue is suspended so a drained cell cannot flush stale writes.
+  private fenced = false;
+  private fenceReason: string | null = null;
+
+  constructor(feePolicy: Partial<FeePolicy> = {}, brownout: BrownoutController = defaultBrownoutController) {
     this.server = new SorobanRpc.Server(config.soroban.rpcUrl);
     this.keypair = Keypair.fromSecret(config.soroban.adminSecret);
     this.contractId = config.soroban.contractId;
     this.networkPassphrase = config.soroban.networkPassphrase;
     this.feePolicy = { ...DEFAULT_FEE_POLICY, ...feePolicy };
     this.canaryRollbackGuard = new CanaryRollbackGuard(config.canary.failureThreshold);
+    this.brownout = brownout;
 
     this.retryQueue = new SubmissionRetryQueue({
       maxRetries: 5,
@@ -292,6 +308,59 @@ export class ContractPublisher {
 
   isPublishingEnabled(): boolean {
     return this.publishingEnabled;
+  }
+
+  // ── Issue #741 — brownout integration ─────────────────────────────────────
+
+  /** Current brownout tier (full | reduced | minimal). */
+  getBrownoutTier(): BrownoutTier {
+    return this.brownout.getTier();
+  }
+
+  /**
+   * Whether a unit of work in the given class may run under the current
+   * brownout tier. Critical price publication always returns true so that
+   * freshness/publication guarantees survive any brownout.
+   */
+  isWorkAllowed(workClass: BrownoutWorkClass): boolean {
+    return this.brownout.isAllowed(workClass);
+  }
+
+  // ── Issue #742 — publisher fencing ────────────────────────────────────────
+
+  /**
+   * Fence the publisher so it stops starting new contract writes. Used by the
+   * maintenance-window orchestrator after traffic drain and before a regional
+   * cell is taken out of service. Idempotent.
+   */
+  fence(reason = 'maintenance'): void {
+    if (this.fenced) return;
+    this.fenced = true;
+    this.fenceReason = reason;
+    this.retryQueue.setSuspended(true, `fenced:${reason}`);
+    logger.warn('[Publisher] Fenced — no new contract writes will be started', {
+      reason,
+      queued: this.retryQueue.getQueueSize(),
+    });
+  }
+
+  /** Remove the fence so publication can resume after maintenance. */
+  unfence(reason = 'maintenance-complete'): void {
+    if (!this.fenced) return;
+    this.fenced = false;
+    this.fenceReason = null;
+    if (this.publishingEnabled) {
+      this.retryQueue.setSuspended(false, `unfenced:${reason}`);
+    }
+    logger.info('[Publisher] Fence removed — publication may resume', { reason });
+  }
+
+  isFenced(): boolean {
+    return this.fenced;
+  }
+
+  getFenceReason(): string | null {
+    return this.fenceReason;
   }
 
   /**
@@ -853,19 +922,41 @@ export class ContractPublisher {
       logger.debug('[Publisher] Skipping contract write: publication is suspended');
       return;
     }
+    // Issue #742 — a fenced publisher must not start new writes; the
+    // orchestrator drains and validates before unfencing.
+    if (this.fenced) {
+      logger.warn('[Publisher] Skipping publish round: publisher is fenced', {
+        reason: this.fenceReason,
+        assets: prices.length,
+      });
+      return;
+    }
     this.resetRoundRpcMetrics();
 
-    // Re-read the on-chain canary registration once per publish round
-    await this.refreshCanary();
+    // Issue #741 — critical price publication is always allowed, but the
+    // optional canary refresh is non-critical and is skipped under minimal
+    // brownout to shed RPC load while preserving price freshness.
+    if (this.brownout.isAllowed('canary_refresh')) {
+      // Re-read the on-chain canary registration once per publish round
+      await this.refreshCanary();
+    } else {
+      logger.debug('[Publisher] Brownout: skipping canary refresh (non-critical)');
+    }
 
     // Issue #577 — attempt the Merkle batch path first.
     // One submit_batch transaction commits the root; N apply_batch_entry
     // transactions (one per asset, but far cheaper than full submit_price)
     // apply the individual prices.  Falls back to per-asset submit_price when
     // batch construction or the commit transaction fails.
-    const batchSucceeded = await this.publishViaBatch(prices);
-    if (batchSucceeded) {
-      return;
+    // Issue #741 — under minimal brownout the batch path is shed entirely and
+    // the cheaper per-asset path is used to reduce transaction count.
+    if (this.brownout.isAllowed('batch_publication')) {
+      const batchSucceeded = await this.publishViaBatch(prices);
+      if (batchSucceeded) {
+        return;
+      }
+    } else {
+      logger.warn('[Publisher] Brownout: batch path shed, using per-asset submission');
     }
 
     // Fallback: per-asset submit_price (original behaviour).
@@ -1151,6 +1242,19 @@ export class ContractPublisher {
 
   processRetryQueue(): void {
     if (!this.publishingEnabled) return;
+    // Issue #742 — never flush the retry queue while fenced.
+    if (this.fenced) {
+      logger.debug('[Publisher] Skipping retry processing: publisher is fenced', {
+        reason: this.fenceReason,
+      });
+      return;
+    }
+    // Issue #741 — retry processing is non-critical work; under minimal
+    // brownout it is deferred so RPC capacity is reserved for fresh prices.
+    if (!this.brownout.isAllowed('retry_processing')) {
+      logger.debug('[Publisher] Brownout: deferring retry queue processing');
+      return;
+    }
     const items = this.retryQueue.getQueueItems();
     for (const item of items) {
       this.submitPrice(item.asset, item.price, item.decimals, item.timestamp)
@@ -1194,6 +1298,15 @@ export class ContractPublisher {
       logger.info(`[Publisher] Draining ${items.length} item(s) from retry queue before exit...`);
       for (const item of items) {
         if (!this.publishingEnabled) break;
+        // Issue #742 — stop draining as soon as the publisher is fenced so a
+        // maintenance drain cannot race with a fresh fence.
+        if (this.fenced) {
+          logger.warn('[Publisher] Drain aborted: publisher was fenced mid-drain', {
+            reason: this.fenceReason,
+            remaining: items.length,
+          });
+          break;
+        }
         try {
           const result = await this.submitPrice(item.asset, item.price, item.decimals, item.timestamp);
           if (result) {
