@@ -13,13 +13,13 @@
 // Shared helpers live in crate::utils (Issue #298), used by both
 // PriceOracleContract and ProxyContract.
 
-use soroban_sdk::{contract, contractimpl, Address, Bytes, Env, String, Vec};
+use soroban_sdk::{contract, contractimpl, Address, Bytes, BytesN, Env, String, Vec};
 
 use crate::errors::OracleError;
 use crate::merkle;
 use crate::types::{
-    AssetPrice, BatchPriceEntry, MerkleProof, MultiSigConfig, MultiSigProposal, PriceDataPoint,
-    ProposalAction, SourceReputation,
+    AssetPrice, BatchPriceEntry, FeedCatalogCommitment, MerkleProof, MultiSigConfig,
+    MultiSigProposal, PriceDataPoint, ProposalAction, SourceReputation,
 };
 
 mod admin;
@@ -370,5 +370,24 @@ impl PriceOracleContract {
         extend_to: u32,
     ) -> Result<(), OracleError> {
         admin::extend_instance_ttl(&env, &caller, threshold, extend_to)
+    }
+
+    // ── Issue #725 — Feed catalog commitment ───────────────────────────────
+
+    pub fn commit_feed_catalog(
+        env: Env,
+        admin: Address,
+        version: u32,
+        catalog_hash: BytesN<32>,
+    ) -> Result<(), OracleError> {
+        admin::commit_feed_catalog(&env, &admin, version, &catalog_hash)
+    }
+
+    pub fn get_feed_catalog_commitment(env: Env) -> Option<FeedCatalogCommitment> {
+        queries::get_feed_catalog_commitment(&env)
+    }
+
+    pub fn get_feed_catalog_version(env: Env) -> u32 {
+        queries::get_feed_catalog_version(&env)
     }
 }

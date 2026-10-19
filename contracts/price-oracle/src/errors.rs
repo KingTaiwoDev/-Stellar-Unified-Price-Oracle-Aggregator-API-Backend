@@ -61,4 +61,6 @@ pub enum OracleError {
     AdminTransferWindowElapsed = 44,
     // Issue #564 — Multi-sig proposal expiry
     ProposalExpired = 45,
+    // Issue #725 — Feed catalog commitment
+    InvalidCatalogVersion = 46,
 }

@@ -4,7 +4,7 @@ use soroban_sdk::{Address, Env, String, Vec};
 
 use crate::errors::OracleError;
 use crate::storage;
-use crate::types::{AssetPrice, PriceDataPoint, SourceReputation};
+use crate::types::{AssetPrice, FeedCatalogCommitment, PriceDataPoint, SourceReputation};
 
 use crate::utils;
 
@@ -143,3 +143,14 @@ pub(crate) fn get_stake_treasury(env: &Env) -> Option<Address> {
 pub(crate) fn get_pending_admin(env: &Env) -> Option<Address> {
     storage::get_pending_admin(env).map(|(admin, _)| admin)
 }
+
+// ── Issue #725 — Feed catalog commitment queries ────────────────────────────
+
+pub(crate) fn get_feed_catalog_commitment(env: &Env) -> Option<FeedCatalogCommitment> {
+    storage::get_feed_catalog_commitment(env)
+}
+
+pub(crate) fn get_feed_catalog_version(env: &Env) -> u32 {
+    storage::get_feed_catalog_commitment(env).map(|c| c.version).unwrap_or(0)
+}
+

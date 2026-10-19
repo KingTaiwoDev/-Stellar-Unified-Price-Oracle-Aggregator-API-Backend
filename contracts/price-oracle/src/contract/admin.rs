@@ -9,14 +9,16 @@
 //           explicit `admin` parameter, call storage::verify_admin, and
 //           return Result<(), OracleError> so rejection surfaces an error code.
 
-use soroban_sdk::{token, Address, Env, String};
+use soroban_sdk::{token, Address, BytesN, Env, String};
 
 use crate::errors::OracleError;
 use crate::events::{
     AdminTransferAccepted, AdminTransferCancelled, AdminTransferProposed, DeviationThresholdSet,
-    ReputationReset, SourceAdded, SourceRemoved, StakeTreasurySet, TrustedAssetSet,
+    FeedCatalogCommitted, ReputationReset, SourceAdded, SourceRemoved, StakeTreasurySet,
+    TrustedAssetSet,
 };
 use crate::storage;
+use crate::types::FeedCatalogCommitment;
 
 pub(crate) fn initialize(env: &Env, admin: &Address) -> Result<(), OracleError> {
     if storage::has_admin(env) {
@@ -325,3 +327,44 @@ pub(crate) fn extend_instance_ttl(
 ) -> Result<(), OracleError> {
     storage::extend_instance_ttl(env, caller, threshold, extend_to)
 }
+
+// ── Issue #725 — Feed catalog commitment ─────────────────────────────────────
+
+pub(crate) fn commit_feed_catalog(
+    env: &Env,
+    admin: &Address,
+    version: u32,
+    catalog_hash: &BytesN<32>,
+) -> Result<(), OracleError> {
+    admin.require_auth();
+    storage::verify_admin(env, admin)?;
+
+    if version == 0 {
+        return Err(OracleError::InvalidCatalogVersion);
+    }
+
+    if let Some(existing) = storage::get_feed_catalog_commitment(env) {
+        if version <= existing.version {
+            return Err(OracleError::InvalidCatalogVersion);
+        }
+    }
+
+    let commitment = FeedCatalogCommitment {
+        version,
+        catalog_hash: catalog_hash.clone(),
+        updated_at: env.ledger().timestamp(),
+        publisher: admin.clone(),
+    };
+    storage::set_feed_catalog_commitment(env, &commitment);
+
+    FeedCatalogCommitted {
+        publisher: admin.clone(),
+        version,
+        catalog_hash: catalog_hash.clone(),
+        timestamp: env.ledger().timestamp(),
+    }
+    .publish(env);
+
+    Ok(())
+}
+

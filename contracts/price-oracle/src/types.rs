@@ -103,6 +103,18 @@ pub enum ProposalAction {
     SetStakeTreasury(Address),
     // Issue #569 — Governed decimals change
     UpdateAssetDecimals(String, u32),
+    // Issue #725 — Feed catalog version commitment
+    CommitFeedCatalog(u32, BytesN<32>),
+}
+
+// Issue #725 — On-chain feed catalog commitment
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeedCatalogCommitment {
+    pub version: u32,
+    pub catalog_hash: BytesN<32>,
+    pub updated_at: u64,
+    pub publisher: Address,
 }
 
 // ── Multi-sig types ──────────────────────────────────────────────────────────
@@ -239,4 +251,6 @@ pub enum DataKey {
     CanaryTrafficShareBps,
     // Issue #565 — Two-step admin handover
     PendingAdmin,
+    // Issue #725 — Feed catalog commitment
+    FeedCatalogCommitment,
 }
