@@ -126,6 +126,44 @@ const commaListSchema = (variable: string, validate: (entry: string) => boolean,
 
 const DEFAULT_WATCHED_ASSETS = 'XLM,USDC,BTC,ETH,USDT';
 
+const DEPLOYMENT_ENVIRONMENTS = ['development', 'staging', 'production'] as const;
+type DeploymentEnvironment = (typeof DEPLOYMENT_ENVIRONMENTS)[number];
+
+const EGRESS_HOST_PATTERN =
+  /^(\*\.)?[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$/;
+
+const REDIRECT_POLICIES = ['deny', 'same-host', 'allowlist'] as const;
+type RedirectPolicy = (typeof REDIRECT_POLICIES)[number];
+
+const DEFAULT_EGRESS_ALLOWLIST: Record<DeploymentEnvironment, string[]> = {
+  development: [],
+  staging: [],
+  production: [],
+};
+
+const DEFAULT_REDIRECT_POLICY: Record<DeploymentEnvironment, RedirectPolicy> = {
+  development: 'deny',
+  staging: 'deny',
+  production: 'deny',
+};
+
+function normalizeEgressHost(entry: string): string | undefined {
+  const trimmed = entry.trim().toLowerCase();
+  if (trimmed === '') return undefined;
+  let hostname = trimmed;
+  if (trimmed.includes('://')) {
+    try {
+      hostname = new URL(trimmed).hostname.toLowerCase();
+    } catch {
+      return undefined;
+    }
+  }
+  hostname = hostname.replace(/\.$/, '');
+  if (hostname === '' || hostname.length > 253) return undefined;
+  if (!EGRESS_HOST_PATTERN.test(hostname)) return undefined;
+  return hostname;
+}
+
 const assetsSchema = z
   .string({ invalid_type_error: 'expected a comma-separated list of asset symbols' })
   .optional()
@@ -262,6 +300,24 @@ const envShape = {
     SSRF_ALLOW_PRIVATE_IPS: boolVar(false),
     OUTBOUND_REQUEST_TIMEOUT_MS: intVar(10000, 100, 300_000),
 
+    DEPLOYMENT_ENVIRONMENT: z
+      .enum(DEPLOYMENT_ENVIRONMENTS, {
+        errorMap: () => ({ message: `expected one of ${DEPLOYMENT_ENVIRONMENTS.join(', ')}` }),
+      })
+      .default('development'),
+    EGRESS_ALLOWLIST: commaListSchema(
+      'EGRESS_ALLOWLIST',
+      (entry) => normalizeEgressHost(entry) !== undefined,
+      'expected a hostname, *.wildcard hostname or absolute URL',
+    ),
+    EGRESS_REDIRECT_POLICY: z
+      .enum(REDIRECT_POLICIES, {
+        errorMap: () => ({ message: `expected one of ${REDIRECT_POLICIES.join(', ')}` }),
+      })
+      .optional(),
+    EGRESS_MAX_REDIRECTS: intVar(0, 0, 10),
+    EGRESS_DNS_REVALIDATE: boolVar(true),
+
     WS_ALLOWED_ORIGINS: commaListSchema(
       'WS_ALLOWED_ORIGINS',
       (entry) => /^https?:\/\/[^/\s]+$/.test(entry) || entry === '*',
@@ -319,9 +375,72 @@ const envSchema = z.object(envShape).superRefine((value, ctx) => {
         'otherwise a quarantined region can never recover',
     });
   }
+
+  const environment = value.DEPLOYMENT_ENVIRONMENT;
+  const allowlist = value.EGRESS_ALLOWLIST ?? [];
+  const redirectPolicy = value.EGRESS_REDIRECT_POLICY ?? DEFAULT_REDIRECT_POLICY[environment];
+
+  if (environment === 'production' && allowlist.length === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['EGRESS_ALLOWLIST'],
+      message:
+        'must list at least one host in production (deny-by-default egress would block all providers)',
+    });
+  }
+
+  if (redirectPolicy === 'allowlist' && allowlist.length === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['EGRESS_REDIRECT_POLICY'],
+      message: 'requires a non-empty EGRESS_ALLOWLIST to validate redirect targets',
+    });
+  }
+
+  if (redirectPolicy === 'deny' && value.EGRESS_MAX_REDIRECTS > 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['EGRESS_MAX_REDIRECTS'],
+      message: 'must be 0 when EGRESS_REDIRECT_POLICY is "deny"',
+    });
+  }
+
+  if (value.SSRF_ALLOW_PRIVATE_IPS && environment === 'production') {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['SSRF_ALLOW_PRIVATE_IPS'],
+      message: 'must be "false" in production so egress cannot reach private networks',
+    });
+  }
 });
 
 export type RawEnvConfig = z.infer<typeof envSchema>;
+
+export interface EgressPolicy {
+  environment: DeploymentEnvironment;
+  allowedHosts: string[];
+  redirectPolicy: RedirectPolicy;
+  maxRedirects: number;
+  revalidateDns: boolean;
+}
+
+export function resolveEgressPolicy(config: RawEnvConfig): EgressPolicy {
+  const environment = config.DEPLOYMENT_ENVIRONMENT;
+  const allowedHosts = Array.from(
+    new Set(
+      (config.EGRESS_ALLOWLIST ?? [])
+        .map((entry) => normalizeEgressHost(entry))
+        .filter((host): host is string => host !== undefined),
+    ),
+  ).sort();
+  return {
+    environment,
+    allowedHosts,
+    redirectPolicy: config.EGRESS_REDIRECT_POLICY ?? DEFAULT_REDIRECT_POLICY[environment],
+    maxRedirects: config.EGRESS_MAX_REDIRECTS,
+    revalidateDns: config.EGRESS_DNS_REVALIDATE,
+  };
+}
 
 export function parseConfigEnv(env: NodeJS.ProcessEnv): RawEnvConfig {
   const result = envSchema.safeParse(env);

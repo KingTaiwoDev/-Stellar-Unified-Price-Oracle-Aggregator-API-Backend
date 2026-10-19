@@ -1,5 +1,6 @@
 import { config } from '../infrastructure/config';
 import { AggregatedPrice } from '../infrastructure/types';
+import { FeedReplicationMonitor } from './feed-replication-monitor';
 import { LwwPriceRegister, RegionPriceRecord } from './price-crdt';
 import { propagateForHop, TraceHeaders } from './trace-context';
 
@@ -16,13 +17,33 @@ export interface DriftReport {
 
 export class RegionPriceReplicator {
   private readonly register = new LwwPriceRegister();
+  private readonly monitor = new FeedReplicationMonitor();
+
+  /** Per-feed / per-region replication lag and sequence-gap monitor (issue #739). */
+  getReplicationMonitor(): FeedReplicationMonitor {
+    return this.monitor;
+  }
 
   mergeLocalPrices(prices: AggregatedPrice[]): void {
     this.register.mergeLocal(config.region.id, prices);
+    for (const price of prices) {
+      this.monitor.record({
+        feed: price.source,
+        region: config.region.id,
+        sequence: price.sequence,
+        observedAt: Date.now(),
+      });
+    }
   }
 
   mergeRemotePrice(record: Omit<RegionPriceRecord, 'receivedAt' | 'source'>): void {
     this.register.merge({ ...record, receivedAt: Date.now(), source: 'remote' });
+    this.monitor.record({
+      feed: record.feed,
+      region: record.region,
+      sequence: record.sequence,
+      observedAt: Date.now(),
+    });
   }
 
   getLatestPrices(): RegionPriceRecord[] {
@@ -50,6 +71,10 @@ export class RegionPriceReplicator {
       carried ? { traceparent: carried.traceparent, tracestate: carried.tracestate } : undefined,
       config.region.id,
     );
+  }
+
+  getReplicationLagReport(now = Date.now()) {
+    return this.monitor.report(now);
   }
 
   getDriftReport(now = Date.now()): DriftReport {

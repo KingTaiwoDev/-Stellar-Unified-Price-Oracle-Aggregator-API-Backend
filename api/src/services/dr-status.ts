@@ -23,6 +23,27 @@ export const drLastDrillRtoSeconds = new client.Gauge({
 });
 register.registerMetric(drLastDrillRtoSeconds);
 
+export const drFeedReplicationLagSeconds = new client.Gauge({
+  name: 'dr_feed_replication_lag_seconds',
+  help: 'Replication lag in seconds for a single feed in a region',
+  labelNames: ['feed', 'region'] as const,
+});
+register.registerMetric(drFeedReplicationLagSeconds);
+
+export const drFeedMissingSequences = new client.Gauge({
+  name: 'dr_feed_missing_sequences',
+  help: 'Number of missing sequence numbers detected for a feed in a region',
+  labelNames: ['feed', 'region'] as const,
+});
+register.registerMetric(drFeedMissingSequences);
+
+export const drFeedHealthy = new client.Gauge({
+  name: 'dr_feed_healthy',
+  help: '1 if the feed in a region is within lag/integrity thresholds, else 0',
+  labelNames: ['feed', 'region'] as const,
+});
+register.registerMetric(drFeedHealthy);
+
 export interface RpoStatus {
   lastBackupAt: string | null;
   ageSeconds: number | null;
@@ -47,6 +68,111 @@ export interface DrReadiness {
   rpo: RpoStatus;
   lastDrill: DrillResult | null;
   ready: boolean;
+  feeds: FeedHealthReport;
+}
+
+export interface FeedLagSample {
+  feed: string;
+  region: string;
+  /** Age in seconds of the newest replicated sequence for this feed/region. */
+  lagSeconds: number;
+  /** Highest contiguous sequence number observed for this feed/region. */
+  lastSequence: number | null;
+  /** Sequence numbers observed but not yet contiguous (gaps). */
+  missingSequences: number[];
+}
+
+export interface FeedHealthThresholds {
+  /** Max acceptable lag in seconds before a feed is considered degraded. */
+  lagSeconds: number;
+  /** Max acceptable number of missing sequences before a feed is unhealthy. */
+  missingSequences: number;
+}
+
+export interface FeedHealth {
+  feed: string;
+  region: string;
+  lagSeconds: number;
+  lastSequence: number | null;
+  missingSequences: number[];
+  healthy: boolean;
+  reasons: string[];
+}
+
+export interface FeedHealthReport {
+  generatedAt: string;
+  thresholds: FeedHealthThresholds;
+  feeds: FeedHealth[];
+  /** Feeds that are unhealthy and should be routed away from. */
+  unhealthyFeeds: string[];
+  /** True when every observed feed is healthy. */
+  allHealthy: boolean;
+}
+
+export const DEFAULT_FEED_THRESHOLDS: FeedHealthThresholds = {
+  lagSeconds: 60,
+  missingSequences: 0,
+};
+
+/** Pure: detect gaps in a set of observed sequence numbers. No IO. */
+export function detectMissingSequences(sequences: number[]): number[] {
+  const unique = Array.from(new Set(sequences.filter((s) => Number.isFinite(s)))).sort(
+    (a, b) => a - b,
+  );
+  if (unique.length < 2) return [];
+  const missing: number[] = [];
+  for (let i = 1; i < unique.length; i++) {
+    const prev = unique[i - 1];
+    const curr = unique[i];
+    for (let s = prev + 1; s < curr; s++) missing.push(s);
+  }
+  return missing;
+}
+
+/** Pure: evaluate a single feed sample against thresholds. No IO. */
+export function evaluateFeedHealth(
+  sample: FeedLagSample,
+  thresholds: FeedHealthThresholds = DEFAULT_FEED_THRESHOLDS,
+): FeedHealth {
+  const reasons: string[] = [];
+  const lagSeconds = Math.max(0, sample.lagSeconds);
+  if (lagSeconds > thresholds.lagSeconds) {
+    reasons.push(`lag ${lagSeconds}s exceeds ${thresholds.lagSeconds}s`);
+  }
+  const missingSequences = sample.missingSequences ?? [];
+  if (missingSequences.length > thresholds.missingSequences) {
+    reasons.push(
+      `${missingSequences.length} missing sequences exceeds ${thresholds.missingSequences}`,
+    );
+  }
+  return {
+    feed: sample.feed,
+    region: sample.region,
+    lagSeconds,
+    lastSequence: sample.lastSequence,
+    missingSequences,
+    healthy: reasons.length === 0,
+    reasons,
+  };
+}
+
+/** Pure: build a full feed health report from samples. No IO. */
+export function computeFeedHealthReport(
+  samples: FeedLagSample[],
+  thresholds: FeedHealthThresholds = DEFAULT_FEED_THRESHOLDS,
+  now: Date = new Date(),
+): FeedHealthReport {
+  const feeds = samples.map((s) => evaluateFeedHealth(s, thresholds));
+  const unhealthyFeeds = Array.from(
+    new Set(feeds.filter((f) => !f.healthy).map((f) => f.feed)),
+  ).sort();
+  return {
+    generatedAt: now.toISOString(),
+    thresholds,
+    feeds,
+    unhealthyFeeds,
+    allHealthy: unhealthyFeeds.length === 0,
+  };
 }
 
 /** Pure: derive RPO status from a list of backup timestamps. No IO. */
@@ -120,6 +246,9 @@ export class DrStatusService {
       rpoTargetSeconds?: number;
       drillReportPath?: string;
       refreshIntervalMs?: number;
+      feedThresholds?: FeedHealthThresholds;
+      /** Optional provider of per-feed replication samples (e.g. from replication monitors). */
+      feedSampleProvider?: () => FeedLagSample[];
     } = {},
   ) {}
 
@@ -131,6 +260,12 @@ export class DrStatusService {
         if (status.rpo.ageSeconds !== null) drRpoSeconds.set(status.rpo.ageSeconds);
         drRpoTargetSeconds.set(status.rpo.targetSeconds);
         if (status.lastDrill) drLastDrillRtoSeconds.set(status.lastDrill.rtoSeconds);
+        for (const feed of status.feeds.feeds) {
+          const labels = { feed: feed.feed, region: feed.region };
+          drFeedReplicationLagSeconds.set(labels, feed.lagSeconds);
+          drFeedMissingSequences.set(labels, feed.missingSequences.length);
+          drFeedHealthy.set(labels, feed.healthy ? 1 : 0);
+        }
       } catch (err) {
         this.logger.warn('DR status refresh failed', err);
       }
@@ -150,11 +285,31 @@ export class DrStatusService {
     });
     const rpo = computeRpoStatus(svc.listBackups(), this.options.rpoTargetSeconds ?? 300);
     const lastDrill = this.readLastDrill();
+    const feeds = this.getFeedHealth();
     return {
       rpo,
       lastDrill,
-      ready: rpo.withinTarget && (lastDrill === null || lastDrill.passed),
+      ready:
+        rpo.withinTarget &&
+        (lastDrill === null || lastDrill.passed) &&
+        feeds.allHealthy,
+      feeds,
     };
+  }
+
+  /** Per-feed replication lag and integrity, used for feed-health based routing. */
+  getFeedHealth(): FeedHealthReport {
+    const thresholds = this.options.feedThresholds ?? DEFAULT_FEED_THRESHOLDS;
+    let samples: FeedLagSample[] = [];
+    if (this.options.feedSampleProvider) {
+      try {
+        samples = this.options.feedSampleProvider();
+      } catch (err) {
+        this.logger.warn('Feed sample provider failed; reporting no feed health', err);
+        samples = [];
+      }
+    }
+    return computeFeedHealthReport(samples, thresholds);
   }
 
   private readLastDrill(): DrillResult | null {

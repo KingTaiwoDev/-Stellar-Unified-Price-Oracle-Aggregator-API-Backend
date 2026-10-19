@@ -89,3 +89,106 @@ This program is intake-managed via the email above pending integration with
 a managed bounty platform (e.g. Immunefi, HackerOne). Once integrated, this
 document will be updated with the platform link and this section will note
 the migration.
+
+## Cryptographic key inventory and lifecycle
+
+Owner: Security lead (inventory custodian), with the platform/backend lead
+accountable for application keys and the contracts lead accountable for
+on-chain keys. The inventory is the authoritative record; no key may be used
+in production unless it appears in it.
+
+Every key entry records: key ID, purpose (signing, encryption, verification,
+or key-agreement), owning team and named individual, algorithm and parameters
+(e.g. Ed25519, secp256k1, AES-256-GCM, HMAC-SHA256), storage location (KMS
+alias, HSM slot, sealed secret), environments where it is valid, creation
+date, rotation interval, retirement deadline, and the transition plan for any
+algorithm change.
+
+Lifecycle rules:
+
+- **Rotation.** Signing and encryption keys rotate at least annually, or
+  immediately on suspected compromise, staff departure with access, or a
+  change in the owning team. Verification-only public keys are rotated in
+  step with their signing counterparts and must overlap for at least one full
+  rotation window so verifiers can pick up the new key.
+- **Retirement.** Retired keys are marked retired in the inventory, removed
+  from active configuration, and retained only for verification of historical
+  artifacts until the retention deadline recorded in the inventory. The
+  retirement deadline is set at creation time and may only be extended with
+  security-lead approval recorded in the inventory.
+- **Algorithm transition.** Any move to a new algorithm or parameter set is
+  recorded as a transition plan with: the new algorithm, the dual-publish or
+  overlap period, the cutover date, the last date the old algorithm is
+  accepted, and the rollback path. Transitions follow publish-new, verify-new,
+  retire-old ordering; the old algorithm is never removed before the overlap
+  period ends.
+
+Review procedure (repeatable, quarterly and on any key change):
+
+1. Export the inventory and diff it against the KMS/HSM key listing and the
+   deployed configuration to find unlisted or orphaned keys.
+2. Confirm each key has a named owner, purpose, algorithm, rotation interval,
+   and retirement deadline; flag any missing field as a finding.
+3. Flag keys past their rotation interval or within 30 days of their
+   retirement deadline.
+4. Confirm each in-flight algorithm transition has a recorded cutover and
+   rollback path.
+5. Record the review date, reviewer, and findings; open tracking issues for
+   every finding and close them before the next review.
+
+Completion evidence: the signed-off review record, the inventory diff output,
+and closed tracking issues for all findings.
+
+## Egress deployment-policy verification
+
+Owner: Platform/backend lead. Scope: all outbound destinations used by
+`services/aggregator/` (oracle-source ingestion) and any provider or
+integration egress from `api/` and `services/vault_manager/`.
+
+Policy: outbound requests are constrained by an environment-specific
+allowlist (host, port, scheme) enforced in code and, where available, at the
+network layer. Redirects are not followed to destinations outside the
+allowlist; each hop is re-validated. DNS resolution is pinned and re-checked
+so a DNS change cannot redirect an approved hostname to an unapproved address.
+
+Verification procedure (repeatable, run on every policy change and at least
+quarterly):
+
+1. **Normal case.** Confirm each configured provider/integration destination
+   resolves and connects successfully under the deployed policy.
+2. **Boundary cases.** Confirm destinations at the edge of the allowlist
+   (alternate ports, subdomain vs. apex, scheme downgrade) are accepted or
+   rejected exactly as the policy specifies.
+3. **Failure cases.** Confirm a destination outside the allowlist is
+   rejected, a redirect to an off-allowlist host is blocked at the hop, and a
+   DNS answer that changes to an unapproved address is rejected.
+4. **Drift check.** Diff the deployed allowlist against the policy source of
+   truth and flag any destination present in one but not the other.
+5. Record the run date, environment, results, and any exceptions; open
+   tracking issues for failures and close them before the next run.
+
+Completion evidence: the recorded verification run (normal, boundary, and
+failure results) and closed tracking issues for any failures.
+
+## Rollout and rollback guidance
+
+- **Key inventory.** Roll out by populating the inventory from the current
+  KMS/HSM listing and deployed configuration before enforcing the "no unlisted
+  key in production" rule; announce the enforcement date to owning teams.
+  Rollback: if enforcement blocks a legitimate key, add the key to the
+  inventory with its owner and lifecycle fields rather than disabling the
+  rule; if the inventory itself is unusable, fall back to the last signed-off
+  review record and re-run the review procedure.
+- **Egress policy.** Roll out in report-only mode first (log would-be
+  rejections without blocking), review the drift and rejection reports, then
+  switch to enforcing per environment. Rollback: revert to the previous
+  allowlist version and report-only mode; the previous version and its
+  verification run are retained so the rollback target is known-good.
+- **Monitoring and compatibility.** Key rotation and retirement events and
+  egress rejections (including blocked redirects and DNS mismatches) emit
+  alerts to the security on-call channel. Both procedures are
+  backward-compatible with existing deployments: verification-only keys
+  overlap their signing counterparts, and egress enforcement only narrows
+  destinations already permitted by policy. Operational impact is limited to
+  the quarterly review effort and any provider onboarding, which must add the
+  destination to the policy source of truth before it is used.
