@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Bytes, BytesN, String, Vec};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, String, Symbol, Vec};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -239,4 +239,7 @@ pub enum DataKey {
     CanaryTrafficShareBps,
     // Issue #565 — Two-step admin handover
     PendingAdmin,
+    // Issue #731 — selective pause of individual feeds and write paths
+    FeedPaused(String),
+    WritePathPaused(Symbol),
 }
