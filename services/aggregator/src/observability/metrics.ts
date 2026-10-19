@@ -321,5 +321,125 @@ export const historyFileWriteFailuresTotal = new client.Counter({
   registers: [register],
 });
 
+// Issue #734 — Regional capacity headroom forecasting.
+// Forecasts are derived from observed traffic, feed count and provider load.
+// Headroom is reported as a ratio (0–1) of remaining capacity, with the
+// uncertainty band exposed as separate lower/upper gauges so dashboards can
+// render a range rather than a single point estimate.
+export const regionalCapacityHeadroomRatio = new client.Gauge({
+  name: 'regional_capacity_headroom_ratio',
+  help: 'Forecast remaining capacity headroom per region as a ratio (0–1)',
+  labelNames: ['region'],
+  registers: [register],
+});
+
+export const regionalCapacityHeadroomLowerRatio = new client.Gauge({
+  name: 'regional_capacity_headroom_lower_ratio',
+  help: 'Lower bound of the forecast capacity headroom ratio per region (0–1)',
+  labelNames: ['region'],
+  registers: [register],
+});
+
+export const regionalCapacityHeadroomUpperRatio = new client.Gauge({
+  name: 'regional_capacity_headroom_upper_ratio',
+  help: 'Upper bound of the forecast capacity headroom ratio per region (0–1)',
+  labelNames: ['region'],
+  registers: [register],
+});
+
+export const regionalCapacityForecastHorizonSeconds = new client.Gauge({
+  name: 'regional_capacity_forecast_horizon_seconds',
+  help: 'Forecast horizon in seconds used for the most recent regional capacity forecast',
+  labelNames: ['region'],
+  registers: [register],
+});
+
+export const regionalCapacityForecastInputs = new client.Gauge({
+  name: 'regional_capacity_forecast_input',
+  help: 'Observed inputs feeding the regional capacity forecast (traffic, feed_count, provider_load)',
+  labelNames: ['region', 'input'],
+  registers: [register],
+});
+
+export const regionalCapacityForecastStale = new client.Gauge({
+  name: 'regional_capacity_forecast_stale',
+  help: 'Whether the regional capacity forecast is stale (1) or fresh (0)',
+  labelNames: ['region'],
+  registers: [register],
+});
+
+export const regionalCapacityForecastErrorsTotal = new client.Counter({
+  name: 'regional_capacity_forecast_errors_total',
+  help: 'Total regional capacity forecast failures by region and reason',
+  labelNames: ['region', 'reason'],
+  registers: [register],
+});
+
+// Issue #744 — Surge limits during failover and recovery.
+// Explicit surge limits cap traffic and cost while degraded so recovery does
+// not itself exceed provider quotas or budgets.
+export const surgeLimitActive = new client.Gauge({
+  name: 'surge_limit_active',
+  help: 'Whether a surge limit is currently enforced (1) or not (0)',
+  labelNames: ['region', 'limit'],
+  registers: [register],
+});
+
+export const surgeLimitTripsTotal = new client.Counter({
+  name: 'surge_limit_trips_total',
+  help: 'Total times a surge limit was tripped by region, limit and reason',
+  labelNames: ['region', 'limit', 'reason'],
+  registers: [register],
+});
+
+export const surgeLimitRejectionsTotal = new client.Counter({
+  name: 'surge_limit_rejections_total',
+  help: 'Total requests or operations rejected because a surge limit was active',
+  labelNames: ['region', 'limit'],
+  registers: [register],
+});
+
+export const surgeLimitUtilizationRatio = new client.Gauge({
+  name: 'surge_limit_utilization_ratio',
+  help: 'Current utilization of a surge limit as a ratio (0–1+)',
+  labelNames: ['region', 'limit'],
+  registers: [register],
+});
+
+export const providerQuotaUtilizationRatio = new client.Gauge({
+  name: 'provider_quota_utilization_ratio',
+  help: 'Current provider quota utilization as a ratio (0–1+), used to trip surge limits before quotas are exceeded',
+  labelNames: ['provider', 'region'],
+  registers: [register],
+});
+
+export const providerQuotaProximityAlertsTotal = new client.Counter({
+  name: 'provider_quota_proximity_alerts_total',
+  help: 'Total alerts raised when provider quota utilization crossed the proximity threshold',
+  labelNames: ['provider', 'region'],
+  registers: [register],
+});
+
+export const costBudgetProximityRatio = new client.Gauge({
+  name: 'cost_budget_proximity_ratio',
+  help: 'Current cost spend vs budget as a ratio (0–1+), used to degrade safely before budgets are exceeded',
+  labelNames: ['scope'],
+  registers: [register],
+});
+
+export const costBudgetProximityAlertsTotal = new client.Counter({
+  name: 'cost_budget_proximity_alerts_total',
+  help: 'Total alerts raised when cost spend crossed the budget proximity threshold',
+  labelNames: ['scope'],
+  registers: [register],
+});
+
+export const safeDegradationActive = new client.Gauge({
+  name: 'safe_degradation_active',
+  help: 'Whether safe degradation mode is active (1) or not (0)',
+  labelNames: ['region', 'mode'],
+  registers: [register],
+});
+
 export { register };
 

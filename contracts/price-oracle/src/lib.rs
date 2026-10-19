@@ -12,6 +12,7 @@ mod governance;
 mod merkle;
 mod multisig;
 mod proxy;
+pub mod samples;
 pub mod storage;
 mod types;
 mod utils;
@@ -34,6 +35,8 @@ mod proxy_test;
 mod ring_buffer_history_test;
 #[cfg(test)]
 mod reputation_decay_test;
+#[cfg(test)]
+mod samples_test;
 #[cfg(test)]
 mod staking_test;
 #[cfg(test)]

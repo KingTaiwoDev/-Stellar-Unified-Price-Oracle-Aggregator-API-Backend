@@ -65,6 +65,26 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       quarantineRecoverPercent: parsed.REGION_QUARANTINE_RECOVER_PERCENT,
       maxReplicationLagMs: parsed.REGION_MAX_REPLICATION_LAG_MS,
     },
+
+    // Issue #744 — surge limits applied during failover and recovery so
+    // traffic/cost spikes cannot exhaust provider quotas or budgets before
+    // alerts fire and safe degradation kicks in.
+    surge: {
+      enabled: parsed.SURGE_LIMITS_ENABLED,
+      // Hard ceiling on outbound provider requests per window.
+      maxRequestsPerWindow: parsed.SURGE_MAX_REQUESTS_PER_WINDOW,
+      windowMs: parsed.SURGE_WINDOW_MS,
+      // Fraction of the normal request rate allowed while recovering (0-1).
+      recoveryRateLimit: parsed.SURGE_RECOVERY_RATE_LIMIT,
+      // Estimated cost ceiling (USD) per window before degradation.
+      maxCostPerWindowUsd: parsed.SURGE_MAX_COST_PER_WINDOW_USD,
+      // Estimated per-request cost (USD) used by the cost model.
+      costPerRequestUsd: parsed.SURGE_COST_PER_REQUEST_USD,
+      // Alert thresholds as a fraction of the configured limits (0-1).
+      alertThresholdPercent: parsed.SURGE_ALERT_THRESHOLD_PERCENT,
+      // When limits are exceeded, degrade instead of failing hard.
+      degradeOnLimit: parsed.SURGE_DEGRADE_ON_LIMIT,
+    },
   },
 
   assets: (process.env.WATCHED_ASSETS || 'XLM,USDC,BTC,ETH,USDT').split(','),

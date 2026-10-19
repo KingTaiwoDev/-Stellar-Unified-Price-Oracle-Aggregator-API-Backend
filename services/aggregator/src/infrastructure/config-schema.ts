@@ -224,6 +224,19 @@ const envShape = {
     REGION_QUARANTINE_RECOVER_PERCENT: floatVar(0.05, 0, 100),
     REGION_MAX_REPLICATION_LAG_MS: intVar(5000, 1, 600_000),
 
+    SURGE_LIMITS_ENABLED: boolVar(true),
+    SURGE_MAX_MULTIPLIER: floatVar(2, 1, 10),
+    SURGE_RECOVERY_MAX_MULTIPLIER: floatVar(1.5, 1, 10),
+    SURGE_MAX_REQUESTS_PER_SECOND: intVar(200, 1, 1_000_000),
+    SURGE_MAX_OUTBOUND_REQUESTS_PER_SECOND: intVar(100, 1, 1_000_000),
+    SURGE_MAX_CONCURRENT_OUTBOUND: intVar(50, 1, 100_000),
+    SURGE_PROVIDER_QUOTA_WARN_PERCENT: floatVar(80, 0, 100),
+    SURGE_PROVIDER_QUOTA_HARD_PERCENT: floatVar(95, 0, 100),
+    SURGE_BUDGET_WARN_PERCENT: floatVar(80, 0, 100),
+    SURGE_BUDGET_HARD_PERCENT: floatVar(95, 0, 100),
+    SURGE_DEGRADE_ON_QUOTA_PRESSURE: boolVar(true),
+    SURGE_ALERT_COOLDOWN_MS: intVar(60_000, 1000, 3_600_000),
+
     KAFKA_BROKERS: commaListSchema(
       'KAFKA_BROKERS',
       (entry) => entry.length > 0 && entry.length <= 253 && !/\s/.test(entry),
@@ -317,6 +330,46 @@ const envSchema = z.object(envShape).superRefine((value, ctx) => {
       message:
         `must be <= REGION_DRIFT_ALERT_PERCENT (${value.REGION_DRIFT_ALERT_PERCENT}) ` +
         'otherwise a quarantined region can never recover',
+    });
+  }
+
+  if (value.SURGE_RECOVERY_MAX_MULTIPLIER > value.SURGE_MAX_MULTIPLIER) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['SURGE_RECOVERY_MAX_MULTIPLIER'],
+      message:
+        `must be <= SURGE_MAX_MULTIPLIER (${value.SURGE_MAX_MULTIPLIER}) ` +
+        'otherwise recovery traffic can exceed the global surge ceiling',
+    });
+  }
+
+  if (value.SURGE_PROVIDER_QUOTA_WARN_PERCENT >= value.SURGE_PROVIDER_QUOTA_HARD_PERCENT) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['SURGE_PROVIDER_QUOTA_WARN_PERCENT'],
+      message:
+        `must be < SURGE_PROVIDER_QUOTA_HARD_PERCENT (${value.SURGE_PROVIDER_QUOTA_HARD_PERCENT}) ` +
+        'so operators are warned before the provider quota is exhausted',
+    });
+  }
+
+  if (value.SURGE_BUDGET_WARN_PERCENT >= value.SURGE_BUDGET_HARD_PERCENT) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['SURGE_BUDGET_WARN_PERCENT'],
+      message:
+        `must be < SURGE_BUDGET_HARD_PERCENT (${value.SURGE_BUDGET_HARD_PERCENT}) ` +
+        'so operators are warned before the cost budget is exhausted',
+    });
+  }
+
+  if (value.SURGE_MAX_OUTBOUND_REQUESTS_PER_SECOND > value.SURGE_MAX_REQUESTS_PER_SECOND) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['SURGE_MAX_OUTBOUND_REQUESTS_PER_SECOND'],
+      message:
+        `must be <= SURGE_MAX_REQUESTS_PER_SECOND (${value.SURGE_MAX_REQUESTS_PER_SECOND}) ` +
+        'otherwise outbound provider traffic can exceed the inbound surge ceiling',
     });
   }
 });

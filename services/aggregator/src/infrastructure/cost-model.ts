@@ -250,6 +250,163 @@ export function reloadPersistedCounts(): void {
   loadPersistedDailyCounts();
 }
 
+// ── Regional capacity forecasting (#734) ────────────────────────────────────
+//
+// Forecasts per-region call volume from observed traffic, feed counts and
+// provider load, then reports capacity headroom against the daily budget with
+// an uncertainty range. The model is deliberately simple and explainable:
+//
+//   forecastCalls = observedCallsPerHour × horizonHours × trafficGrowthFactor
+//                 × (1 + feedCountWeight × feedCountDelta)
+//                 × (1 + providerLoadWeight × (providerLoad - 1))
+//
+// Uncertainty is a symmetric band whose half-width grows with the forecast
+// horizon and with provider load (loaded providers are noisier). Headroom is
+// the remaining budget after the forecast; a negative headroom means the
+// region is projected to exhaust its budget before the horizon ends.
+//
+// Degraded inputs never throw: missing/negative/non-finite observations are
+// clamped to safe defaults and flagged in `degradedInputs` so operators can
+// alert on forecast quality rather than on crashes.
+
+export interface RegionalCapacityInput {
+  /** Region identifier, e.g. `us-east-1`. */
+  region: string;
+  /** Observed calls per hour over the measurement window. */
+  observedCallsPerHour: number;
+  /** Number of feeds served from this region. */
+  feedCount: number;
+  /** Baseline feed count the observation was calibrated against. */
+  baselineFeedCount?: number;
+  /** Provider load factor: 1.0 = nominal, >1 = loaded, <1 = idle. */
+  providerLoad: number;
+  /** Forecast horizon in hours (default 24). */
+  horizonHours?: number;
+  /** Expected traffic growth over the horizon (1.0 = flat, default 1.0). */
+  trafficGrowthFactor?: number;
+  /** Daily budget for the region; defaults to the sum of source budgets. */
+  dailyBudgetCalls?: number;
+}
+
+export interface RegionalCapacityForecast {
+  region: string;
+  forecastCalls: number;
+  lowerBoundCalls: number;
+  upperBoundCalls: number;
+  /** Fraction of the daily budget consumed by the forecast (0..1+). */
+  utilization: number;
+  /** Remaining budget after the forecast; negative = projected exhaustion. */
+  headroomCalls: number;
+  /** Headroom as a fraction of the budget (may be negative). */
+  headroomRatio: number;
+  /** True when the upper bound exceeds the budget. */
+  atRisk: boolean;
+  degradedInputs: string[];
+}
+
+/** Relative half-width of the uncertainty band at a 1-hour horizon. */
+export const FORECAST_BASE_UNCERTAINTY = 0.1;
+/** Additional relative uncertainty per extra forecast hour. */
+export const FORECAST_UNCERTAINTY_PER_HOUR = 0.01;
+/** Weight applied to feed-count deltas in the forecast. */
+export const FORECAST_FEED_COUNT_WEIGHT = 0.5;
+/** Weight applied to provider-load deltas in the forecast. */
+export const FORECAST_PROVIDER_LOAD_WEIGHT = 0.25;
+
+function defaultRegionalBudget(): number {
+  return Object.values(DAILY_BUDGET_CALLS).reduce((sum, b) => sum + b, 0);
+}
+
+function finiteOr(value: number, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+/**
+ * Forecast regional capacity and headroom with an uncertainty range.
+ * Pure function: does not read or mutate counters, so it is safe to call from
+ * /health, dashboards and tests.
+ */
+export function forecastRegionalCapacity(input: RegionalCapacityInput): RegionalCapacityForecast {
+  const degradedInputs: string[] = [];
+
+  const region = typeof input.region === 'string' && input.region ? input.region : 'unknown';
+  if (region === 'unknown') degradedInputs.push('region');
+
+  let observedCallsPerHour = finiteOr(input.observedCallsPerHour, 0);
+  if (observedCallsPerHour < 0) {
+    degradedInputs.push('observedCallsPerHour');
+    observedCallsPerHour = 0;
+  }
+
+  let feedCount = finiteOr(input.feedCount, 0);
+  if (feedCount < 0) {
+    degradedInputs.push('feedCount');
+    feedCount = 0;
+  }
+
+  const baselineFeedCount = finiteOr(input.baselineFeedCount ?? feedCount, feedCount);
+  let providerLoad = finiteOr(input.providerLoad, 1);
+  if (providerLoad < 0) {
+    degradedInputs.push('providerLoad');
+    providerLoad = 0;
+  }
+
+  let horizonHours = finiteOr(input.horizonHours ?? 24, 24);
+  if (horizonHours <= 0) {
+    degradedInputs.push('horizonHours');
+    horizonHours = 24;
+  }
+
+  let trafficGrowthFactor = finiteOr(input.trafficGrowthFactor ?? 1, 1);
+  if (trafficGrowthFactor < 0) {
+    degradedInputs.push('trafficGrowthFactor');
+    trafficGrowthFactor = 1;
+  }
+
+  const budget = finiteOr(input.dailyBudgetCalls ?? defaultRegionalBudget(), 0);
+  if (budget <= 0) degradedInputs.push('dailyBudgetCalls');
+
+  const feedDelta = baselineFeedCount > 0 ? (feedCount - baselineFeedCount) / baselineFeedCount : 0;
+  const feedFactor = Math.max(0, 1 + FORECAST_FEED_COUNT_WEIGHT * feedDelta);
+  const loadFactor = Math.max(0, 1 + FORECAST_PROVIDER_LOAD_WEIGHT * (providerLoad - 1));
+
+  const forecastCalls = observedCallsPerHour * horizonHours * trafficGrowthFactor * feedFactor * loadFactor;
+
+  const relativeUncertainty =
+    FORECAST_BASE_UNCERTAINTY +
+    FORECAST_UNCERTAINTY_PER_HOUR * Math.max(0, horizonHours - 1) +
+    FORECAST_PROVIDER_LOAD_WEIGHT * Math.max(0, providerLoad - 1);
+  const band = forecastCalls * relativeUncertainty;
+
+  const lowerBoundCalls = Math.max(0, forecastCalls - band);
+  const upperBoundCalls = forecastCalls + band;
+  const utilization = budget > 0 ? forecastCalls / budget : 0;
+  const headroomCalls = budget - forecastCalls;
+  const headroomRatio = budget > 0 ? headroomCalls / budget : 0;
+
+  return {
+    region,
+    forecastCalls,
+    lowerBoundCalls,
+    upperBoundCalls,
+    utilization,
+    headroomCalls,
+    headroomRatio,
+    atRisk: budget > 0 && upperBoundCalls > budget,
+    degradedInputs,
+  };
+}
+
+/** Forecast every region in one pass, keyed by region id. */
+export function forecastRegions(inputs: RegionalCapacityInput[]): Record<string, RegionalCapacityForecast> {
+  const out: Record<string, RegionalCapacityForecast> = {};
+  for (const input of inputs) {
+    const forecast = forecastRegionalCapacity(input);
+    out[forecast.region] = forecast;
+  }
+  return out;
+}
+
 export interface CostModelIntegrityResult {
   valid: boolean;
   driftDetected: boolean;
@@ -263,6 +420,8 @@ export interface CostModelIntegrityResult {
  * Alerts if runtime assumptions diverge from the approved capacity model beyond tolerance.
  */
 export function verifyRuntimeCostModelIntegrity(customModelPath?: string): CostModelIntegrityResult {
+  // NOTE (#734): regional capacity forecasts are derived from the same
+  // budgets/rates reconciled here; drift in this model invalidates forecasts.
   const defaultPath = path.resolve(__dirname, '../../../../config/cost-model.json');
   const targetPath = customModelPath || defaultPath;
 

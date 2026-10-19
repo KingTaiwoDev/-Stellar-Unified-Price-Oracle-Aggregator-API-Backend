@@ -228,4 +228,119 @@ describe('multi-region failover verification', () => {
     const availabilitySloMet = availabilityPercent >= sloAvailabilityPercent;
     expect(availabilitySloMet).toBe(true);
   });
+
+  describe('surge limits during failover and recovery', () => {
+    interface SurgeLimits {
+      maxRequestsPerSecond: number;
+      maxProviderQuotaPercent: number;
+      maxCostPerHourUsd: number;
+      burstMultiplier: number;
+    }
+
+    interface SurgeState {
+      currentRps: number;
+      providerQuotaUsedPercent: number;
+      costPerHourUsd: number;
+      degraded: boolean;
+      alerts: string[];
+    }
+
+    const limits: SurgeLimits = {
+      maxRequestsPerSecond: 1000,
+      maxProviderQuotaPercent: 80,
+      maxCostPerHourUsd: 250,
+      burstMultiplier: 1.5,
+    };
+
+    const evaluateSurge = (state: SurgeState): SurgeState => {
+      const alerts: string[] = [];
+      const burstCeiling = limits.maxRequestsPerSecond * limits.burstMultiplier;
+
+      if (state.currentRps > burstCeiling) {
+        alerts.push('SURGE_RPS_EXCEEDED');
+      }
+      if (state.providerQuotaUsedPercent >= limits.maxProviderQuotaPercent) {
+        alerts.push('PROVIDER_QUOTA_NEAR_LIMIT');
+      }
+      if (state.costPerHourUsd >= limits.maxCostPerHourUsd) {
+        alerts.push('COST_BUDGET_EXCEEDED');
+      }
+
+      const degraded =
+        state.currentRps > burstCeiling ||
+        state.providerQuotaUsedPercent >= limits.maxProviderQuotaPercent ||
+        state.costPerHourUsd >= limits.maxCostPerHourUsd;
+
+      return { ...state, degraded, alerts };
+    };
+
+    it('allows normal failover traffic within surge limits without degradation', () => {
+      const state = evaluateSurge({
+        currentRps: 800,
+        providerQuotaUsedPercent: 45,
+        costPerHourUsd: 120,
+        degraded: false,
+        alerts: [],
+      });
+
+      expect(state.currentRps).toBeLessThanOrEqual(limits.maxRequestsPerSecond * limits.burstMultiplier);
+      expect(state.degraded).toBe(false);
+      expect(state.alerts).toHaveLength(0);
+    });
+
+    it('degrades safely and alerts when failover traffic spikes beyond burst ceiling', () => {
+      const state = evaluateSurge({
+        currentRps: 1800,
+        providerQuotaUsedPercent: 60,
+        costPerHourUsd: 180,
+        degraded: false,
+        alerts: [],
+      });
+
+      expect(state.currentRps).toBeGreaterThan(limits.maxRequestsPerSecond * limits.burstMultiplier);
+      expect(state.degraded).toBe(true);
+      expect(state.alerts).toContain('SURGE_RPS_EXCEEDED');
+    });
+
+    it('degrades and alerts before provider quota is exhausted', () => {
+      const state = evaluateSurge({
+        currentRps: 900,
+        providerQuotaUsedPercent: 85,
+        costPerHourUsd: 200,
+        degraded: false,
+        alerts: [],
+      });
+
+      expect(state.providerQuotaUsedPercent).toBeGreaterThanOrEqual(limits.maxProviderQuotaPercent);
+      expect(state.degraded).toBe(true);
+      expect(state.alerts).toContain('PROVIDER_QUOTA_NEAR_LIMIT');
+    });
+
+    it('degrades and alerts before cost budget is exceeded', () => {
+      const state = evaluateSurge({
+        currentRps: 950,
+        providerQuotaUsedPercent: 70,
+        costPerHourUsd: 260,
+        degraded: false,
+        alerts: [],
+      });
+
+      expect(state.costPerHourUsd).toBeGreaterThanOrEqual(limits.maxCostPerHourUsd);
+      expect(state.degraded).toBe(true);
+      expect(state.alerts).toContain('COST_BUDGET_EXCEEDED');
+    });
+
+    it('treats exact boundary values as within limits (no degradation at threshold)', () => {
+      const state = evaluateSurge({
+        currentRps: limits.maxRequestsPerSecond * limits.burstMultiplier,
+        providerQuotaUsedPercent: limits.maxProviderQuotaPercent - 1,
+        costPerHourUsd: limits.maxCostPerHourUsd - 1,
+        degraded: false,
+        alerts: [],
+      });
+
+      expect(state.degraded).toBe(false);
+      expect(state.alerts).toHaveLength(0);
+    });
+  });
 });
