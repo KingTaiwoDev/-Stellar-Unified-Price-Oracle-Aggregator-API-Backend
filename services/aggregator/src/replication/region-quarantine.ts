@@ -90,7 +90,24 @@ export class RegionQuarantineManager {
 
   async evaluate(report: DriftReport): Promise<RegionFailbackEvaluation> {
     const previous = this.status.quarantined;
-    const quarantined = this.nextState(report);
+    const driftQuarantined = this.nextState(report);
+    const feedEvaluations = this.evaluateFeeds(feedSignals);
+
+    const degradedFeeds = feedEvaluations.filter((f) => f.quarantined);
+    const quarantined = driftQuarantined || degradedFeeds.length > 0;
+
+    let reason: string | undefined;
+    if (quarantined) {
+      if (previous && this.status.reason) {
+        reason = this.status.reason;
+      } else if (driftQuarantined) {
+        reason = `drift ${report.maxDriftPercent.toFixed(4)}% exceeds ${config.region.driftAlertPercent}%`;
+      } else {
+        reason = `feed degradation: ${degradedFeeds
+          .map((f) => `${f.feedId} (${f.reason})`)
+          .join(', ')}`;
+      }
+    }
 
     this.status = quarantined
       ? {

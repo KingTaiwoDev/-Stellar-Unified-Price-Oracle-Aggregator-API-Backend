@@ -131,6 +131,111 @@ export interface DrReadiness {
   lastExercises: DependencyExerciseResult[];
   lastFailback: FailbackDrillResult | null;
   ready: boolean;
+  feeds: FeedHealthReport;
+}
+
+export interface FeedLagSample {
+  feed: string;
+  region: string;
+  /** Age in seconds of the newest replicated sequence for this feed/region. */
+  lagSeconds: number;
+  /** Highest contiguous sequence number observed for this feed/region. */
+  lastSequence: number | null;
+  /** Sequence numbers observed but not yet contiguous (gaps). */
+  missingSequences: number[];
+}
+
+export interface FeedHealthThresholds {
+  /** Max acceptable lag in seconds before a feed is considered degraded. */
+  lagSeconds: number;
+  /** Max acceptable number of missing sequences before a feed is unhealthy. */
+  missingSequences: number;
+}
+
+export interface FeedHealth {
+  feed: string;
+  region: string;
+  lagSeconds: number;
+  lastSequence: number | null;
+  missingSequences: number[];
+  healthy: boolean;
+  reasons: string[];
+}
+
+export interface FeedHealthReport {
+  generatedAt: string;
+  thresholds: FeedHealthThresholds;
+  feeds: FeedHealth[];
+  /** Feeds that are unhealthy and should be routed away from. */
+  unhealthyFeeds: string[];
+  /** True when every observed feed is healthy. */
+  allHealthy: boolean;
+}
+
+export const DEFAULT_FEED_THRESHOLDS: FeedHealthThresholds = {
+  lagSeconds: 60,
+  missingSequences: 0,
+};
+
+/** Pure: detect gaps in a set of observed sequence numbers. No IO. */
+export function detectMissingSequences(sequences: number[]): number[] {
+  const unique = Array.from(new Set(sequences.filter((s) => Number.isFinite(s)))).sort(
+    (a, b) => a - b,
+  );
+  if (unique.length < 2) return [];
+  const missing: number[] = [];
+  for (let i = 1; i < unique.length; i++) {
+    const prev = unique[i - 1];
+    const curr = unique[i];
+    for (let s = prev + 1; s < curr; s++) missing.push(s);
+  }
+  return missing;
+}
+
+/** Pure: evaluate a single feed sample against thresholds. No IO. */
+export function evaluateFeedHealth(
+  sample: FeedLagSample,
+  thresholds: FeedHealthThresholds = DEFAULT_FEED_THRESHOLDS,
+): FeedHealth {
+  const reasons: string[] = [];
+  const lagSeconds = Math.max(0, sample.lagSeconds);
+  if (lagSeconds > thresholds.lagSeconds) {
+    reasons.push(`lag ${lagSeconds}s exceeds ${thresholds.lagSeconds}s`);
+  }
+  const missingSequences = sample.missingSequences ?? [];
+  if (missingSequences.length > thresholds.missingSequences) {
+    reasons.push(
+      `${missingSequences.length} missing sequences exceeds ${thresholds.missingSequences}`,
+    );
+  }
+  return {
+    feed: sample.feed,
+    region: sample.region,
+    lagSeconds,
+    lastSequence: sample.lastSequence,
+    missingSequences,
+    healthy: reasons.length === 0,
+    reasons,
+  };
+}
+
+/** Pure: build a full feed health report from samples. No IO. */
+export function computeFeedHealthReport(
+  samples: FeedLagSample[],
+  thresholds: FeedHealthThresholds = DEFAULT_FEED_THRESHOLDS,
+  now: Date = new Date(),
+): FeedHealthReport {
+  const feeds = samples.map((s) => evaluateFeedHealth(s, thresholds));
+  const unhealthyFeeds = Array.from(
+    new Set(feeds.filter((f) => !f.healthy).map((f) => f.feed)),
+  ).sort();
+  return {
+    generatedAt: now.toISOString(),
+    thresholds,
+    feeds,
+    unhealthyFeeds,
+    allHealthy: unhealthyFeeds.length === 0,
+  };
 }
 
 /** Pure: derive RPO status from a list of backup timestamps. No IO. */
@@ -345,6 +450,9 @@ export class DrStatusService {
       exerciseReportPath?: string;
       failbackReportPath?: string;
       refreshIntervalMs?: number;
+      feedThresholds?: FeedHealthThresholds;
+      /** Optional provider of per-feed replication samples (e.g. from replication monitors). */
+      feedSampleProvider?: () => FeedLagSample[];
     } = {},
   ) {}
 

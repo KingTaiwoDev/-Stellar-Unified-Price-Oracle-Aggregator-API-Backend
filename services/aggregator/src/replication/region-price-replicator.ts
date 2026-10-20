@@ -1,5 +1,6 @@
 import { config } from '../infrastructure/config';
 import { AggregatedPrice } from '../infrastructure/types';
+import { FeedReplicationMonitor } from './feed-replication-monitor';
 import { LwwPriceRegister, RegionPriceRecord } from './price-crdt';
 import { propagateForHop, TraceHeaders } from './trace-context';
 import { metrics } from '../infrastructure/metrics';
@@ -305,6 +306,10 @@ export class RegionPriceReplicator {
       carried ? { traceparent: carried.traceparent, tracestate: carried.tracestate } : undefined,
       config.region.id,
     );
+  }
+
+  getReplicationLagReport(now = Date.now()) {
+    return this.monitor.report(now);
   }
 
   getDriftReport(now = Date.now()): DriftReport {

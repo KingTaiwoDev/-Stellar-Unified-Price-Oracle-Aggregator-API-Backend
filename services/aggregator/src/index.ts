@@ -13,6 +13,8 @@ import { FileArchivalService } from './persistence/file-archival';
 import { RegionPriceReplicator } from './replication/region-price-replicator';
 import { RegionQuarantineManager } from './replication/region-quarantine';
 import { KafkaReplicator } from './replication/kafka-replicator';
+import { FeedReplicationMonitor } from './replication/feed-replication-monitor';
+import { FeedHealthRouter } from './replication/feed-health-router';
 import {
   oracleSourceUptimePercent,
   onChainPriceStalenessSeconds,
@@ -86,6 +88,21 @@ const aggregator = new PriceAggregator();
 const fileArchival = new FileArchivalService();
 const regionReplicator = new RegionPriceReplicator();
 const regionQuarantine = new RegionQuarantineManager();
+// Issue #739 — per-feed replication lag and missing-sequence tracking.
+const feedReplicationMonitor = new FeedReplicationMonitor({
+  lagWarnMs: config.region.feedLagWarnMs,
+  lagCriticalMs: config.region.feedLagCriticalMs,
+  missingSequenceThreshold: config.region.feedMissingSequenceThreshold,
+  windowSize: config.region.feedLagWindowSize,
+});
+// Issue #740 — consumer routing driven by per-feed freshness and integrity.
+const feedHealthRouter = new FeedHealthRouter({
+  priority: config.region.feedRoutingPriority,
+  lagWarnMs: config.region.feedLagWarnMs,
+  lagCriticalMs: config.region.feedLagCriticalMs,
+  missingSequenceThreshold: config.region.feedMissingSequenceThreshold,
+});
+regionReplicator.setFeedMonitor(feedReplicationMonitor);
 const alertManager = new AlertManager({
   webhookUrl: process.env.ALERT_WEBHOOK_URL ? decryptSecret(process.env.ALERT_WEBHOOK_URL) : undefined,
   slackWebhookUrl: process.env.ALERT_SLACK_WEBHOOK_URL ? decryptSecret(process.env.ALERT_SLACK_WEBHOOK_URL) : undefined,
@@ -269,7 +286,7 @@ async function poll(): Promise<AggregatedPrice[]> {
   if (drift.maxDriftPercent > config.region.driftAlertPercent) {
     logger.warn('Cross-region price drift exceeds threshold', drift);
   }
-  const quarantine = regionQuarantine.evaluate(drift);
+  const quarantine = regionQuarantine.evaluate(drift, feedReplicationMonitor.getFeedHealthSnapshot());
   if (quarantine.transition) {
     logger[quarantine.quarantined ? 'error' : 'info'](`Region ${config.region.id} ${quarantine.transition}`, {
       quarantine,
@@ -291,6 +308,28 @@ async function poll(): Promise<AggregatedPrice[]> {
       !quarantine.quarantined,
       quarantine.quarantined ? quarantine.reason ?? 'cross-region drift' : 'quarantine cleared',
     );
+  }
+
+  // Issue #739/#740 — evaluate per-feed health and route consumers accordingly.
+  const feedHealth = feedReplicationMonitor.evaluate();
+  const routingDecision = feedHealthRouter.route(feedHealth);
+  if (routingDecision.failover) {
+    logger.warn('Feed health routing triggered failover', {
+      region: config.region.id,
+      decision: routingDecision,
+    });
+    await alertManager.reportFeedHealthFailover({
+      region: config.region.id,
+      decision: routingDecision,
+      feeds: feedHealth,
+    });
+  }
+  for (const feed of feedHealth) {
+    if (feed.status === 'critical') {
+      logger.error('Feed replication lag critical', { region: config.region.id, feed });
+    } else if (feed.status === 'degraded') {
+      logger.warn('Feed replication lag degraded', { region: config.region.id, feed });
+    }
   }
 
   const unhealthy = sources.filter((s) => !s.health.healthy);
@@ -644,6 +683,8 @@ async function main(): Promise<void> {
     closeServers: async () => {
       // #583 — flush persisted daily call counters so budgets survive restarts.
       flushDailyCounts();
+      // #739 — flush final per-feed lag metrics before listeners close.
+      feedReplicationMonitor.flushMetrics();
       wss.stop();
       healthServer.stop();
     },

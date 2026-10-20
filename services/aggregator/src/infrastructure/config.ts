@@ -197,6 +197,24 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
         allowPrivateIps: parsed.SSRF_ALLOW_PRIVATE_IPS,
         requestTimeoutMs: parsed.OUTBOUND_REQUEST_TIMEOUT_MS,
       },
+      // Issue #750 — outbound egress policy. Every provider/integration
+      // destination must match this allowlist; redirects are re-validated
+      // against it and DNS answers are pinned to the resolved address so a
+      // DNS change cannot silently widen egress. The allowlist is derived from
+      // the configured source hosts plus ORACLE_ALLOWED_HOSTS, so it is
+      // environment-specific by construction (dev/staging/prod each set their
+      // own source URLs). See docs/EGRESS_POLICY.md for rollout/rollback.
+      egress: {
+        enabled: parsed.EGRESS_POLICY_ENABLED,
+        allowedHosts: [...deriveSourceHosts(sourceUrls), ...parsed.ORACLE_ALLOWED_HOSTS],
+        allowPrivateIps: parsed.SSRF_ALLOW_PRIVATE_IPS,
+        // Redirects are followed only when the new destination is also allowed.
+        followRedirects: parsed.EGRESS_FOLLOW_REDIRECTS,
+        maxRedirects: parsed.EGRESS_MAX_REDIRECTS,
+        // Pin DNS resolution for the lifetime of a request to defeat rebinding.
+        pinDns: parsed.EGRESS_PIN_DNS,
+        requestTimeoutMs: parsed.OUTBOUND_REQUEST_TIMEOUT_MS,
+      },
       websocket: {
         allowedOrigins: parsed.WS_ALLOWED_ORIGINS,
         requireOrigin: parsed.WS_REQUIRE_ORIGIN,

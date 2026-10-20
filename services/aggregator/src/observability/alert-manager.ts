@@ -96,6 +96,7 @@ class AlertManager {
   private invalidPayloadTimestamps: Map<string, number[]> = new Map();
   private lastAlertAtByKey: Map<string, number> = new Map();
   private alertTriggerHistory: Map<string, number[]> = new Map();
+  private feedMissingSequenceTimestamps: Map<string, number[]> = new Map();
   private static readonly DEFAULT_CONFIG: AlertConfig = {
     webhookRetries: 3,
     webhookRetryDelayMs: 1000,
