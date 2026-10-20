@@ -68,6 +68,57 @@ pub fn is_paused(env: &Env) -> bool {
         .unwrap_or(false)
 }
 
+// ── Issue #731 — selective (per-feed / per-write-path) pause flags ────────────
+//
+// The global `Paused` flag above is all-or-nothing: resuming it re-enables
+// every write path at once.  These finer-grained flags let an operator pause
+// (and later recover) a single feed or a single write path while leaving
+// unrelated paths untouched.  A path is considered paused when *either* the
+// global flag or its own flag is set, so recovery of a selective pause can
+// never implicitly lift a global pause (and vice versa).
+
+/// Pause or resume a single feed (identified by asset symbol).
+pub fn set_feed_paused(env: &Env, feed: &String, paused: bool) {
+    env.storage()
+        .instance()
+        .set(&DataKey::FeedPaused(feed.clone()), &paused);
+}
+
+/// True when the feed has been explicitly paused.
+pub fn is_feed_paused(env: &Env, feed: &String) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::FeedPaused(feed.clone()))
+        .unwrap_or(false)
+}
+
+/// True when writes for this feed must be rejected, taking the global pause
+/// into account.
+pub fn is_feed_write_blocked(env: &Env, feed: &String) -> bool {
+    is_paused(env) || is_feed_paused(env, feed)
+}
+
+/// Pause or resume a single write path (e.g. "submit_price", "apply_batch").
+pub fn set_write_path_paused(env: &Env, path: &String, paused: bool) {
+    env.storage()
+        .instance()
+        .set(&DataKey::WritePathPaused(path.clone()), &paused);
+}
+
+/// True when the write path has been explicitly paused.
+pub fn is_write_path_paused(env: &Env, path: &String) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::WritePathPaused(path.clone()))
+        .unwrap_or(false)
+}
+
+/// True when writes through this path must be rejected, taking the global
+/// pause into account.
+pub fn is_write_path_blocked(env: &Env, path: &String) -> bool {
+    is_paused(env) || is_write_path_paused(env, path)
+}
+
 // ── Proxy / upgrade keys ──────────────────────────────────────────────────────
 
 pub fn set_implementation(env: &Env, implementation: &Address) {
