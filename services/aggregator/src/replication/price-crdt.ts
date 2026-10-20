@@ -85,6 +85,7 @@ export class LwwPriceRegister {
     // LWW: only update if new record has later timestamp
     if (!current || record.timestamp > current.timestamp) {
       this.values.set(key, record);
+      return 'applied';
     }
     return true;
   }
@@ -96,6 +97,7 @@ export class LwwPriceRegister {
   mergeLocal(region: string, prices: AggregatedPrice[], now = Date.now()): void {
     const epoch = this.currentEpoch(region);
     for (const price of prices) {
+      const ownership = this.ownership.get(price.asset);
       this.merge({
         region,
         asset: price.asset,
@@ -215,5 +217,12 @@ export class LwwPriceRegister {
    */
   clear(): void {
     this.values.clear();
+  }
+
+  /**
+   * Clear ownership metadata (used when reconciling state after a transition).
+   */
+  clearOwnership(): void {
+    this.ownership.clear();
   }
 }

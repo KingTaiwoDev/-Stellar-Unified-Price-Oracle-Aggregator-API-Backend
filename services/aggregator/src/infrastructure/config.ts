@@ -13,6 +13,49 @@ function deriveSourceHosts(urls: string[]): string[] {
   return Array.from(hosts);
 }
 
+export interface FeedOwnership {
+  primary: string;
+  failover: string;
+}
+
+function buildFeedOwnership(
+  parsed: ReturnType<typeof parseConfigEnv>,
+  regionId: string,
+): Record<string, FeedOwnership> {
+  const ownership: Record<string, FeedOwnership> = {};
+
+  // Lowest precedence: per-asset env vars.
+  for (const asset of parsed.WATCHED_ASSETS) {
+    const key = asset.toUpperCase().replace(/[^A-Z0-9]/g, '_');
+    const primary = parsed.FEED_PRIMARY_REGION[asset] ?? parsed.FEED_PRIMARY_REGION[key];
+    const failover = parsed.FEED_FAILOVER_REGION[asset] ?? parsed.FEED_FAILOVER_REGION[key];
+    if (primary || failover) {
+      ownership[asset] = {
+        primary: (primary ?? regionId).toLowerCase(),
+        failover: (failover ?? primary ?? regionId).toLowerCase(),
+      };
+    }
+  }
+
+  // Highest precedence: explicit JSON map.
+  for (const [asset, entry] of Object.entries(parsed.FEED_OWNERSHIP_JSON)) {
+    ownership[asset] = {
+      primary: (entry.primary ?? regionId).toLowerCase(),
+      failover: (entry.failover ?? entry.primary ?? regionId).toLowerCase(),
+    };
+  }
+
+  // Default any unconfigured asset to the local region for both roles so every
+  // feed always has exactly one authorized publisher.
+  for (const asset of parsed.WATCHED_ASSETS) {
+    if (!ownership[asset]) {
+      ownership[asset] = { primary: regionId.toLowerCase(), failover: regionId.toLowerCase() };
+    }
+  }
+
+  return ownership;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
   const parsed = parseConfigEnv(env);
 
