@@ -229,118 +229,168 @@ describe('multi-region failover verification', () => {
     expect(availabilitySloMet).toBe(true);
   });
 
-  describe('surge limits during failover and recovery', () => {
-    interface SurgeLimits {
-      maxRequestsPerSecond: number;
-      maxProviderQuotaPercent: number;
-      maxCostPerHourUsd: number;
-      burstMultiplier: number;
+  describe('single-publisher fencing', () => {
+    interface PublisherEpoch {
+      region: string;
+      epoch: number;
+      isLeader: boolean;
     }
 
-    interface SurgeState {
-      currentRps: number;
-      providerQuotaUsedPercent: number;
-      costPerHourUsd: number;
-      degraded: boolean;
-      alerts: string[];
+    interface Submission {
+      region: string;
+      epoch: number;
+      price: number;
+      timestamp: number;
     }
 
-    const limits: SurgeLimits = {
-      maxRequestsPerSecond: 1000,
-      maxProviderQuotaPercent: 80,
-      maxCostPerHourUsd: 250,
-      burstMultiplier: 1.5,
+    interface FencedPublisher {
+      currentEpoch: number;
+      leaderRegion: string;
+      acceptedSubmissions: Submission[];
+      rejectedSubmissions: Array<Submission & { reason: string }>;
+    }
+
+    const createPublisher = (leaderRegion: string, currentEpoch: number): FencedPublisher => ({
+      currentEpoch,
+      leaderRegion,
+      acceptedSubmissions: [],
+      rejectedSubmissions: [],
+    });
+
+    const submit = (publisher: FencedPublisher, submission: Submission): boolean => {
+      if (submission.epoch < publisher.currentEpoch) {
+        publisher.rejectedSubmissions.push({ ...submission, reason: 'stale-epoch' });
+        return false;
+      }
+      if (submission.epoch > publisher.currentEpoch) {
+        publisher.rejectedSubmissions.push({ ...submission, reason: 'future-epoch' });
+        return false;
+      }
+      if (submission.region !== publisher.leaderRegion) {
+        publisher.rejectedSubmissions.push({ ...submission, reason: 'not-leader' });
+        return false;
+      }
+      publisher.acceptedSubmissions.push(submission);
+      return true;
     };
 
-    const evaluateSurge = (state: SurgeState): SurgeState => {
-      const alerts: string[] = [];
-      const burstCeiling = limits.maxRequestsPerSecond * limits.burstMultiplier;
-
-      if (state.currentRps > burstCeiling) {
-        alerts.push('SURGE_RPS_EXCEEDED');
-      }
-      if (state.providerQuotaUsedPercent >= limits.maxProviderQuotaPercent) {
-        alerts.push('PROVIDER_QUOTA_NEAR_LIMIT');
-      }
-      if (state.costPerHourUsd >= limits.maxCostPerHourUsd) {
-        alerts.push('COST_BUDGET_EXCEEDED');
-      }
-
-      const degraded =
-        state.currentRps > burstCeiling ||
-        state.providerQuotaUsedPercent >= limits.maxProviderQuotaPercent ||
-        state.costPerHourUsd >= limits.maxCostPerHourUsd;
-
-      return { ...state, degraded, alerts };
+    const promote = (publisher: FencedPublisher, leaderRegion: string, newEpoch: number): void => {
+      expect(newEpoch).toBeGreaterThan(publisher.currentEpoch);
+      publisher.currentEpoch = newEpoch;
+      publisher.leaderRegion = leaderRegion;
     };
 
-    it('allows normal failover traffic within surge limits without degradation', () => {
-      const state = evaluateSurge({
-        currentRps: 800,
-        providerQuotaUsedPercent: 45,
-        costPerHourUsd: 120,
-        degraded: false,
-        alerts: [],
-      });
+    it('rejects submissions from a partitioned region holding a stale epoch', () => {
+      const publisher = createPublisher('us-east-1', 5);
+      promote(publisher, 'eu-west-1', 6);
 
-      expect(state.currentRps).toBeLessThanOrEqual(limits.maxRequestsPerSecond * limits.burstMultiplier);
-      expect(state.degraded).toBe(false);
-      expect(state.alerts).toHaveLength(0);
+      const partitionedRegion: PublisherEpoch = { region: 'us-east-1', epoch: 5, isLeader: false };
+      expect(partitionedRegion.isLeader).toBe(false);
+
+      const staleSubmission: Submission = {
+        region: partitionedRegion.region,
+        epoch: partitionedRegion.epoch,
+        price: 100.75,
+        timestamp: Date.now(),
+      };
+
+      const accepted = submit(publisher, staleSubmission);
+
+      expect(accepted).toBe(false);
+      expect(publisher.acceptedSubmissions).toHaveLength(0);
+      expect(publisher.rejectedSubmissions).toHaveLength(1);
+      expect(publisher.rejectedSubmissions[0].reason).toBe('stale-epoch');
+      expect(publisher.rejectedSubmissions[0].region).toBe('us-east-1');
     });
 
-    it('degrades safely and alerts when failover traffic spikes beyond burst ceiling', () => {
-      const state = evaluateSurge({
-        currentRps: 1800,
-        providerQuotaUsedPercent: 60,
-        costPerHourUsd: 180,
-        degraded: false,
-        alerts: [],
-      });
+    it('requires a restarted region to observe the current epoch before publishing', () => {
+      const persistedEpoch = 7;
+      const publisher = createPublisher('eu-west-1', persistedEpoch);
 
-      expect(state.currentRps).toBeGreaterThan(limits.maxRequestsPerSecond * limits.burstMultiplier);
-      expect(state.degraded).toBe(true);
-      expect(state.alerts).toContain('SURGE_RPS_EXCEEDED');
+      const restartedRegion: PublisherEpoch = { region: 'us-east-1', epoch: persistedEpoch - 1, isLeader: false };
+
+      const preObservationSubmission: Submission = {
+        region: restartedRegion.region,
+        epoch: restartedRegion.epoch,
+        price: 101.2,
+        timestamp: Date.now(),
+      };
+
+      expect(submit(publisher, preObservationSubmission)).toBe(false);
+      expect(publisher.rejectedSubmissions[0].reason).toBe('stale-epoch');
+
+      restartedRegion.epoch = publisher.currentEpoch;
+      expect(restartedRegion.epoch).toBe(persistedEpoch);
+
+      const postObservationSubmission: Submission = {
+        region: restartedRegion.region,
+        epoch: restartedRegion.epoch,
+        price: 101.2,
+        timestamp: Date.now(),
+      };
+
+      expect(submit(publisher, postObservationSubmission)).toBe(false);
+      expect(publisher.rejectedSubmissions[1].reason).toBe('not-leader');
+
+      const leaderSubmission: Submission = {
+        region: publisher.leaderRegion,
+        epoch: publisher.currentEpoch,
+        price: 101.2,
+        timestamp: Date.now(),
+      };
+
+      expect(submit(publisher, leaderSubmission)).toBe(true);
+      expect(publisher.acceptedSubmissions).toHaveLength(1);
     });
 
-    it('degrades and alerts before provider quota is exhausted', () => {
-      const state = evaluateSurge({
-        currentRps: 900,
-        providerQuotaUsedPercent: 85,
-        costPerHourUsd: 200,
-        degraded: false,
-        alerts: [],
-      });
+    it('accepts only the higher epoch in a split-brain leadership claim', () => {
+      const publisher = createPublisher('us-east-1', 10);
 
-      expect(state.providerQuotaUsedPercent).toBeGreaterThanOrEqual(limits.maxProviderQuotaPercent);
-      expect(state.degraded).toBe(true);
-      expect(state.alerts).toContain('PROVIDER_QUOTA_NEAR_LIMIT');
+      const claimants: PublisherEpoch[] = [
+        { region: 'us-east-1', epoch: 10, isLeader: true },
+        { region: 'eu-west-1', epoch: 11, isLeader: true },
+      ];
+
+      const highestEpoch = Math.max(...claimants.map((c) => c.epoch));
+      const winner = claimants.find((c) => c.epoch === highestEpoch)!;
+      expect(winner.region).toBe('eu-west-1');
+
+      promote(publisher, winner.region, winner.epoch);
+
+      const results = claimants.map((claimant) =>
+        submit(publisher, {
+          region: claimant.region,
+          epoch: claimant.epoch,
+          price: 102.0,
+          timestamp: Date.now(),
+        }),
+      );
+
+      expect(results).toEqual([false, true]);
+      expect(publisher.acceptedSubmissions).toHaveLength(1);
+      expect(publisher.acceptedSubmissions[0].region).toBe('eu-west-1');
+      expect(publisher.acceptedSubmissions[0].epoch).toBe(11);
+      expect(publisher.rejectedSubmissions).toHaveLength(1);
+      expect(publisher.rejectedSubmissions[0].reason).toBe('stale-epoch');
+
+      const authorityRegions = new Set(publisher.acceptedSubmissions.map((s) => s.region));
+      expect(authorityRegions.size).toBe(1);
+      expect(publisher.leaderRegion).toBe('eu-west-1');
     });
 
-    it('degrades and alerts before cost budget is exceeded', () => {
-      const state = evaluateSurge({
-        currentRps: 950,
-        providerQuotaUsedPercent: 70,
-        costPerHourUsd: 260,
-        degraded: false,
-        alerts: [],
-      });
+    it('rejects a future epoch that has not been promoted by the authority', () => {
+      const publisher = createPublisher('us-east-1', 3);
 
-      expect(state.costPerHourUsd).toBeGreaterThanOrEqual(limits.maxCostPerHourUsd);
-      expect(state.degraded).toBe(true);
-      expect(state.alerts).toContain('COST_BUDGET_EXCEEDED');
-    });
+      const speculativeSubmission: Submission = {
+        region: 'us-east-1',
+        epoch: 4,
+        price: 99.5,
+        timestamp: Date.now(),
+      };
 
-    it('treats exact boundary values as within limits (no degradation at threshold)', () => {
-      const state = evaluateSurge({
-        currentRps: limits.maxRequestsPerSecond * limits.burstMultiplier,
-        providerQuotaUsedPercent: limits.maxProviderQuotaPercent - 1,
-        costPerHourUsd: limits.maxCostPerHourUsd - 1,
-        degraded: false,
-        alerts: [],
-      });
-
-      expect(state.degraded).toBe(false);
-      expect(state.alerts).toHaveLength(0);
+      expect(submit(publisher, speculativeSubmission)).toBe(false);
+      expect(publisher.rejectedSubmissions[0].reason).toBe('future-epoch');
+      expect(publisher.currentEpoch).toBe(3);
     });
   });
 });

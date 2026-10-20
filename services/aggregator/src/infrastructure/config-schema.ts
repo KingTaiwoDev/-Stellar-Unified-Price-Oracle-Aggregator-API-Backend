@@ -23,6 +23,7 @@ export class ConfigValidationError extends Error {
 }
 
 const LOG_LEVELS = ['error', 'warn', 'info', 'http', 'verbose', 'debug', 'silly'] as const;
+const BROWNOUT_TIERS = ['none', 'tier1', 'tier2', 'tier3'] as const;
 const ASSET_SYMBOL = /^[A-Z0-9][A-Z0-9:_-]{0,31}$/;
 const REGION_ID = /^[a-z0-9][a-z0-9-]{0,62}$/;
 const HEX_KEY_64 = /^[0-9a-f]{64}$/i;
@@ -224,18 +225,22 @@ const envShape = {
     REGION_QUARANTINE_RECOVER_PERCENT: floatVar(0.05, 0, 100),
     REGION_MAX_REPLICATION_LAG_MS: intVar(5000, 1, 600_000),
 
-    SURGE_LIMITS_ENABLED: boolVar(true),
-    SURGE_MAX_MULTIPLIER: floatVar(2, 1, 10),
-    SURGE_RECOVERY_MAX_MULTIPLIER: floatVar(1.5, 1, 10),
-    SURGE_MAX_REQUESTS_PER_SECOND: intVar(200, 1, 1_000_000),
-    SURGE_MAX_OUTBOUND_REQUESTS_PER_SECOND: intVar(100, 1, 1_000_000),
-    SURGE_MAX_CONCURRENT_OUTBOUND: intVar(50, 1, 100_000),
-    SURGE_PROVIDER_QUOTA_WARN_PERCENT: floatVar(80, 0, 100),
-    SURGE_PROVIDER_QUOTA_HARD_PERCENT: floatVar(95, 0, 100),
-    SURGE_BUDGET_WARN_PERCENT: floatVar(80, 0, 100),
-    SURGE_BUDGET_HARD_PERCENT: floatVar(95, 0, 100),
-    SURGE_DEGRADE_ON_QUOTA_PRESSURE: boolVar(true),
-    SURGE_ALERT_COOLDOWN_MS: intVar(60_000, 1000, 3_600_000),
+    BROWNOUT_TIER: z
+      .enum(BROWNOUT_TIERS, {
+        errorMap: () => ({ message: `expected one of ${BROWNOUT_TIERS.join(', ')}` }),
+      })
+      .default('none'),
+    BROWNOUT_MAX_PRICE_AGE_MS: intVar(120000, 1, 86_400_000),
+    BROWNOUT_SHED_HISTORY: boolVar(false),
+    BROWNOUT_SHED_ARCHIVAL: boolVar(false),
+    BROWNOUT_SHED_NON_CRITICAL_FEEDS: boolVar(false),
+
+    MAINTENANCE_WINDOW_ENABLED: boolVar(false),
+    MAINTENANCE_DRAIN_TIMEOUT_MS: intVar(60000, 1000, 3_600_000),
+    MAINTENANCE_PRECHECK_MAX_STALENESS_MS: intVar(120000, 1, 86_400_000),
+    MAINTENANCE_PRECHECK_MIN_HEALTHY_PEERS: intVar(1, 0, 100),
+    MAINTENANCE_PUBLISHER_FENCING_ENABLED: boolVar(true),
+    MAINTENANCE_POSTCHECK_TIMEOUT_MS: intVar(120000, 1000, 3_600_000),
 
     KAFKA_BROKERS: commaListSchema(
       'KAFKA_BROKERS',
@@ -332,44 +337,40 @@ const envSchema = z.object(envShape).superRefine((value, ctx) => {
         'otherwise a quarantined region can never recover',
     });
   }
-
-  if (value.SURGE_RECOVERY_MAX_MULTIPLIER > value.SURGE_MAX_MULTIPLIER) {
+  if (value.BROWNOUT_MAX_PRICE_AGE_MS > value.STALENESS_THRESHOLD_MS) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
-      path: ['SURGE_RECOVERY_MAX_MULTIPLIER'],
+      path: ['BROWNOUT_MAX_PRICE_AGE_MS'],
       message:
-        `must be <= SURGE_MAX_MULTIPLIER (${value.SURGE_MAX_MULTIPLIER}) ` +
-        'otherwise recovery traffic can exceed the global surge ceiling',
+        `must be <= STALENESS_THRESHOLD_MS (${value.STALENESS_THRESHOLD_MS}) ` +
+        'otherwise brownout mode can serve prices the normal path would reject',
     });
   }
-
-  if (value.SURGE_PROVIDER_QUOTA_WARN_PERCENT >= value.SURGE_PROVIDER_QUOTA_HARD_PERCENT) {
+  if (value.MAINTENANCE_PRECHECK_MAX_STALENESS_MS > value.STALENESS_THRESHOLD_MS) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
-      path: ['SURGE_PROVIDER_QUOTA_WARN_PERCENT'],
+      path: ['MAINTENANCE_PRECHECK_MAX_STALENESS_MS'],
       message:
-        `must be < SURGE_PROVIDER_QUOTA_HARD_PERCENT (${value.SURGE_PROVIDER_QUOTA_HARD_PERCENT}) ` +
-        'so operators are warned before the provider quota is exhausted',
+        `must be <= STALENESS_THRESHOLD_MS (${value.STALENESS_THRESHOLD_MS}) ` +
+        'otherwise maintenance prechecks accept stale prices',
     });
   }
-
-  if (value.SURGE_BUDGET_WARN_PERCENT >= value.SURGE_BUDGET_HARD_PERCENT) {
+  if (value.MAINTENANCE_WINDOW_ENABLED && value.REGION_PEERS.length === 0) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
-      path: ['SURGE_BUDGET_WARN_PERCENT'],
+      path: ['REGION_PEERS'],
       message:
-        `must be < SURGE_BUDGET_HARD_PERCENT (${value.SURGE_BUDGET_HARD_PERCENT}) ` +
-        'so operators are warned before the cost budget is exhausted',
+        'must list at least one peer when MAINTENANCE_WINDOW_ENABLED is true ' +
+        'so traffic can be drained before maintenance',
     });
   }
-
-  if (value.SURGE_MAX_OUTBOUND_REQUESTS_PER_SECOND > value.SURGE_MAX_REQUESTS_PER_SECOND) {
+  if (value.MAINTENANCE_WINDOW_ENABLED && value.MAINTENANCE_PRECHECK_MIN_HEALTHY_PEERS === 0) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
-      path: ['SURGE_MAX_OUTBOUND_REQUESTS_PER_SECOND'],
+      path: ['MAINTENANCE_PRECHECK_MIN_HEALTHY_PEERS'],
       message:
-        `must be <= SURGE_MAX_REQUESTS_PER_SECOND (${value.SURGE_MAX_REQUESTS_PER_SECOND}) ` +
-        'otherwise outbound provider traffic can exceed the inbound surge ceiling',
+        'must be >= 1 when MAINTENANCE_WINDOW_ENABLED is true ' +
+        'so maintenance cannot start without a healthy peer to take over',
     });
   }
 });

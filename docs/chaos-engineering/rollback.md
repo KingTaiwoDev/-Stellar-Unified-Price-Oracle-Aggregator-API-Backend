@@ -59,137 +59,213 @@ The weekly resilience CronJob additionally verifies `environment=staging` on the
 
 ---
 
-# Regional Release Train: Ordering, Promotion, Halt, and Surge Controls
+## Exiting brownout mode (#741)
 
-This section defines how a staged release train is coordinated across regions so
-that regional rollouts never outrun verified health. It covers release ordering,
-promotion criteria, automatic halt conditions, surge limits during failover and
-recovery, and the rollback procedures for regional rollouts.
+Brownout mode sheds non-critical work while preserving explicit price freshness and
+publication guarantees. It is controlled by the `BROWNOUT_MODE` flag and the
+`BROWNOUT_SHED` allow-list. Owner: Global Operations and Resilience.
 
-**Owner:** Global Operations and Resilience team (`#stellar-oracle-ops`).
-**Scope:** All production regions in the release train (see ordering below).
-**Completion evidence:** Promotion gates recorded per region in the release
-train log, halt events captured as alerts, and the repeatable review procedure
-in [Verification and review](#verification-and-review).
+### When to exit
 
-## Release ordering (staged train)
+Exit brownout when the triggering condition has cleared and the following hold for
+at least one full freshness window:
 
-Regions are promoted in fixed waves. A wave may not begin until the previous
-wave has met promotion criteria and its soak window has elapsed.
+- `oracle_price_freshness_seconds` is within SLO for every published pair.
+- `oracle_publication_lag_seconds` p99 is back under its threshold.
+- Error budget burn rate is below the page threshold.
 
-| Wave | Regions | Soak before next wave |
-|------|---------|-----------------------|
-| 0 | `staging` | 30 min |
-| 1 | `canary` (single low-traffic region) | 60 min |
-| 2 | `us-east`, `eu-west` | 120 min |
-| 3 | remaining regions | — (final wave) |
+### Rollback steps
 
-Rules:
+1. Re-enable shed work incrementally (never all at once):
 
-- Waves advance strictly in order; no region may skip a wave.
-- A region in a later wave is blocked while any earlier-wave region is halted.
-- The train is driven by the release train controller; manual promotion is only
-  permitted with an explicit override recorded in the train log.
+   ```bash
+   # Step 1: restore non-critical background jobs
+   kubectl -n stellar-oracle set env deploy/aggregator BROWNOUT_SHED="exports,analytics"
+   # Step 2: restore remaining shed work
+   kubectl -n stellar-oracle set env deploy/aggregator BROWNOUT_SHED=""
+   # Step 3: disable brownout mode entirely
+   kubectl -n stellar-oracle set env deploy/aggregator BROWNOUT_MODE="off"
+   ```
 
-## Promotion criteria
+2. If freshness or publication regresses after any step, immediately re-enter
+   brownout by reversing the last step:
 
-A region is promoted to the next wave only when **all** of the following hold
-for the full soak window:
+   ```bash
+   kubectl -n stellar-oracle set env deploy/aggregator BROWNOUT_MODE="on"
+   ```
 
-- Error rate ≤ baseline + 0.5% (5xx and gRPC `UNAVAILABLE`).
-- p99 latency ≤ baseline × 1.2.
-- Health checks green (`/api/v1/health` and dependency probes).
-- No active automatic halt condition (below).
-- Surge budget usage within limits (below).
-
-If any criterion is unmet at the end of the soak window, the train halts at the
-current wave and the region is held for investigation.
-
-## Automatic halt conditions
-
-The train halts automatically — and no further wave is promoted — when any of
-the following is observed in any active region:
-
-- Error rate exceeds baseline + 2% for 5 consecutive minutes.
-- p99 latency exceeds baseline × 1.5 for 5 consecutive minutes.
-- Health check failures on ≥ 2 consecutive probes.
-- Surge budget or provider quota usage ≥ 90% of the configured ceiling.
-- A rollback is triggered in any region.
-
-On halt, the controller:
-
-1. Stops promoting new waves.
-2. Emits a `release_train_halted` alert to `#stellar-oracle-ops`.
-3. Records the triggering region and condition in the train log.
-4. Leaves already-promoted regions running unless their own halt condition fires.
-
-Resuming requires the halt condition to clear and an explicit operator
-acknowledgement recorded in the train log.
-
-## Surge limits during failover and recovery
-
-To protect recovery from traffic and cost spikes, explicit surge limits apply
-during failover and recovery:
-
-- **Traffic surge cap:** recovery traffic per region is capped at the configured
-  surge ceiling (default 1.5× steady-state). Excess requests are shed with
-  `429`/`503` and a `Retry-After` header rather than queued unboundedly.
-- **Cost/quota ceiling:** provider quota and cost budgets are tracked; at 80%
-  usage an early-warning alert fires, and at 90% the train halts (above) and
-  degradation begins.
-- **Safe degradation order:** shed non-critical traffic first (analytics,
-  batch), then reduce fan-out, then fail over to the next region — never exceed
-  the surge ceiling to "catch up".
-- **Alerts:** `surge_budget_warning` (80%) and `surge_budget_critical` (90%)
-  route to `#stellar-oracle-ops`.
-
-## Rollback procedures for regional rollouts
-
-Roll back a single region without disturbing the rest of the train:
+### Verification
 
 ```bash
-# Pin the region back to the last known-good release
-kubectl -n stellar-oracle-<region> rollout undo deployment/api
-kubectl -n stellar-oracle-<region> rollout undo deployment/aggregator
-
-# Confirm the region is healthy again
-kubectl -n stellar-oracle-<region> rollout status deployment/api
-curl -sf https://<region>.stellar-oracle.example/api/v1/health
+# Confirm flag state
+kubectl -n stellar-oracle get deploy/aggregator -o jsonpath='{.spec.template.spec.containers[0].env}'
+# Confirm freshness and publication metrics recovered
+curl -sf http://localhost:3000/api/v1/health | jq '.brownout'
+curl -sf http://localhost:9090/api/v1/query \
+  --data-urlencode 'query=oracle_price_freshness_seconds' | jq '.data.result'
 ```
 
-Roll back the entire train (halt and revert all active waves):
+### Rollout / rollback guidance
+
+- Roll out brownout flags via the deployment overlay, not ad-hoc `kubectl set env`,
+  in production. The commands above are the emergency path.
+- Monitor `brownout_active`, `oracle_price_freshness_seconds`, and
+  `oracle_publication_lag_seconds` dashboards during both entry and exit.
+- Rollback of a brownout exit is always "re-enter brownout" — it is safe and
+  idempotent.
+
+---
+
+## Aborting a regional maintenance window (#742)
+
+Maintenance windows run a guarded workflow: prechecks → traffic drain → publisher
+fencing → maintenance → post-validation. Owner: Global Operations and Resilience.
+
+### Abort at any phase
+
+The maintenance controller exposes an abort endpoint that reverses the current
+phase safely. Abort is idempotent and safe to call from any phase.
 
 ```bash
-# Halt the train first so no further waves promote
-kubectl -n stellar-oracle patch releasetrain release-train \
-  --type merge -p '{"spec":{"halted":true}}'
-
-# Revert each active region to its last known-good release
-for region in canary us-east eu-west; do
-  kubectl -n stellar-oracle-$region rollout undo deployment/api
-  kubectl -n stellar-oracle-$region rollout undo deployment/aggregator
-done
+# Abort the named window for a region
+curl -sf -X POST http://localhost:3000/api/v1/maintenance/abort \
+  -H 'content-type: application/json' \
+  -d '{"region":"us-east-1","reason":"operator abort"}'
 ```
 
-After any rollback:
+If the controller is unreachable, abort manually in reverse phase order:
 
-1. Confirm the automatic halt condition has cleared.
-2. Notify `#stellar-oracle-ops` and record the rollback in the train log.
-3. Document findings in [incident-review.md](incident-review.md).
+1. **Unfence publishers** (if fenced):
 
-## Verification and review
+   ```bash
+   kubectl -n stellar-oracle label deploy/publisher \
+     maintenance-fenced- --overwrite
+   ```
 
-This procedure is repeatable and covers normal, boundary, and failure cases:
+2. **Restore traffic** (if drained):
 
-- **Normal:** a full train promotion through all waves with criteria met.
-- **Boundary:** a region held exactly at the soak-window edge and at the 80%/90%
-  surge thresholds.
-- **Failure:** an injected halt condition mid-train, verifying no later wave
-  promotes and the alert fires.
+   ```bash
+   kubectl -n stellar-oracle patch service aggregator --type merge \
+     -p '{"spec":{"selector":{"app":"aggregator"}}}'
+   ```
 
-Run the train in `staging` (Wave 0) before any production promotion, and review
-the train log and alerts weekly. Compatibility: the surge caps and halt
-thresholds are configuration-driven and default to the values above, so existing
-regions are unaffected until a train is started. Monitoring: `release_train_halted`,
-`surge_budget_warning`, and `surge_budget_critical` alerts plus the per-region
-promotion log provide measurable completion evidence.
+3. **Clear the window record** so the scheduler does not resume a half-run window:
+
+   ```bash
+   kubectl -n stellar-oracle delete configmap maintenance-window-us-east-1 --ignore-not-found
+   ```
+
+### Verification
+
+```bash
+# Window state should be "aborted" or absent
+curl -sf http://localhost:3000/api/v1/maintenance/status?region=us-east-1 | jq
+# Publishers unfenced and serving
+kubectl -n stellar-oracle get deploy/publisher -o jsonpath='{.metadata.labels}'
+# Traffic restored
+kubectl -n stellar-oracle get endpoints aggregator
+# Freshness/publication intact
+curl -sf http://localhost:3000/api/v1/health | jq '.maintenance, .freshness'
+```
+
+### Rollout / rollback guidance
+
+- Enable maintenance automation per-region behind the `MAINTENANCE_AUTOMATION`
+  flag; start with a single canary region.
+- Monitor `maintenance_phase`, `maintenance_aborts_total`, and publisher fencing
+  state during rollout.
+- Rollback of the automation itself: set `MAINTENANCE_AUTOMATION=off`; any
+  in-flight window must be aborted first using the steps above.
+
+---
+
+## Tenant-isolation failure response (#747)
+
+Adversarial tenant-isolation tests run in CI across caches, REST, GraphQL,
+WebSockets, exports, and background jobs. A failure means a tenant boundary may be
+crossable. Owner: Security and Privacy Assurance.
+
+### Immediate response
+
+1. **Treat as a potential data-exposure incident.** Page the on-call security
+   engineer and open an incident.
+2. **Contain** by disabling the affected shared path if it can be isolated:
+
+   ```bash
+   # Example: disable cross-tenant export path
+   kubectl -n stellar-oracle set env deploy/api TENANT_EXPORTS_ENABLED="false"
+   ```
+
+3. **Preserve evidence** — capture the failing test seed and request trace:
+
+   ```bash
+   pnpm test:fuzz:tenant -- --seed "$FAILING_SEED" --repro > tenant-repro.log
+   ```
+
+### Rollback steps
+
+- If the regression was introduced by a recent deploy, roll back to the last
+  known-good image:
+
+  ```bash
+  kubectl -n stellar-oracle rollout undo deploy/api
+  kubectl -n stellar-oracle rollout status deploy/api
+  ```
+
+- Re-enable any contained path only after the fix is verified by the fuzz suite.
+
+### Verification
+
+```bash
+# Full tenant-isolation fuzz suite must pass
+pnpm test:fuzz:tenant
+# Confirm no cross-tenant cache keys leaked
+curl -sf http://localhost:3000/api/v1/health | jq '.tenant_isolation'
+```
+
+---
+
+## Authorization regression failure response (#749)
+
+The authorization regression corpus is a versioned matrix of allowed/denied
+actions across roles, scopes, lifecycle states, and API versions, run in CI. A
+failure means an action's allow/deny outcome changed unexpectedly. Owner: Security
+and Privacy Assurance.
+
+### Immediate response
+
+1. **Do not merge** the change that broke the corpus. The CI gate blocks it.
+2. Determine whether the change is an **intended** policy change or a **regression**:
+   - Intended: update the corpus matrix in the same PR with reviewer sign-off.
+   - Regression: revert the offending change.
+
+### Rollback steps
+
+```bash
+# Revert the offending commit (or roll back the deploy)
+git revert <offending-sha>
+# If already deployed:
+kubectl -n stellar-oracle rollout undo deploy/api
+kubectl -n stellar-oracle rollout status deploy/api
+```
+
+### Verification
+
+```bash
+# Corpus must pass against the running build
+pnpm test:authz:corpus
+# Spot-check a denied action is still denied
+curl -sf -o /dev/null -w '%{http_code}\n' \
+  -H 'authorization: Bearer <low-scope-token>' \
+  http://localhost:3000/api/v1/admin/tenants
+# Expect 403
+```
+
+### Rollout / rollback guidance
+
+- The corpus is versioned alongside the code; policy changes and matrix updates
+  ship together.
+- Monitor `authz_denied_total` and `authz_corpus_failures_total`; a spike in either
+  after deploy warrants a rollback.
+- Rollback of a policy change is a normal deploy rollback; the corpus re-runs
+  automatically on the rolled-back build.

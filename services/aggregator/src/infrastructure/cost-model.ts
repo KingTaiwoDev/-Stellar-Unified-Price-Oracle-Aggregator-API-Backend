@@ -250,161 +250,218 @@ export function reloadPersistedCounts(): void {
   loadPersistedDailyCounts();
 }
 
-// ── Regional capacity forecasting (#734) ────────────────────────────────────
+// ── Consumer-side storage & transaction cost estimation (#727) ──────────────
 //
-// Forecasts per-region call volume from observed traffic, feed counts and
-// provider load, then reports capacity headroom against the daily budget with
-// an uncertainty range. The model is deliberately simple and explainable:
+// Methodology
+// -----------
+// Consumer contracts pay two kinds of cost when reading/writing oracle feeds:
 //
-//   forecastCalls = observedCallsPerHour × horizonHours × trafficGrowthFactor
-//                 × (1 + feedCountWeight × feedCountDelta)
-//                 × (1 + providerLoadWeight × (providerLoad - 1))
+//   1. Storage: every persisted entry (e.g. a cached price per feed) occupies
+//      ledger space. Soroban charges rent per ledger entry per ledger, so the
+//      storage cost scales linearly with the number of feeds touched and with
+//      the number of ledgers the entry must stay live.
+//   2. Transaction: each read/write is a transaction whose fee is
+//      `baseFee + instructions * feePerInstruction + ledgerBytes * feePerByte`.
+//      The instruction/byte footprint scales with the number of feeds in the
+//      call (a read of N feeds is roughly N times a single-feed read).
 //
-// Uncertainty is a symmetric band whose half-width grows with the forecast
-// horizon and with provider load (loaded providers are noisier). Headroom is
-// the remaining budget after the forecast; a negative headroom means the
-// region is projected to exhaust its budget before the horizon ends.
+// The constants below are the *benchmark outputs* captured by the consumer
+// cost benchmark (see `docs/cost-model.md` and the benchmark script). They are
+// deliberately conservative (rounded up) so estimates are upper bounds.
 //
-// Degraded inputs never throw: missing/negative/non-finite observations are
-// clamped to safe defaults and flagged in `degradedInputs` so operators can
-// alert on forecast quality rather than on crashes.
+// Assumptions
+// -----------
+//   - Fees are expressed in stroops (1 XLM = 10,000,000 stroops).
+//   - `feePerInstruction` / `feePerByte` reflect the network fee conditions
+//     supplied by the caller (e.g. surge pricing); defaults are the baseline
+//     mainnet conditions.
+//   - Storage rent is charged per ledger entry per ledger; `rentPerEntryPerLedger`
+//     is the amortized rate. `retentionLedgers` is how long the entry must live.
+//   - Per-feed footprints are linear: no batching discount is assumed.
+//   - The estimate excludes one-off contract upload/instantiation costs.
 
-export interface RegionalCapacityInput {
-  /** Region identifier, e.g. `us-east-1`. */
-  region: string;
-  /** Observed calls per hour over the measurement window. */
-  observedCallsPerHour: number;
-  /** Number of feeds served from this region. */
+/** Stroops per XLM. */
+export const STROOPS_PER_XLM = 10_000_000;
+
+/** Benchmark: instruction footprint of a single-feed read. */
+export const BENCH_READ_INSTRUCTIONS_PER_FEED = 12_000;
+/** Benchmark: instruction footprint of a single-feed write (persist). */
+export const BENCH_WRITE_INSTRUCTIONS_PER_FEED = 28_000;
+/** Benchmark: ledger bytes written per persisted feed entry. */
+export const BENCH_STORAGE_BYTES_PER_FEED = 256;
+/** Benchmark: ledger bytes of transaction envelope overhead (feed-independent). */
+export const BENCH_TX_ENVELOPE_BYTES = 512;
+
+/** Baseline network fee conditions (mainnet defaults). */
+export const DEFAULT_FEE_CONDITIONS: NetworkFeeConditions = {
+  baseFeeStroops: 100,
+  feePerInstructionStroops: 25,
+  feePerByteStroops: 1_000,
+  rentPerEntryPerLedgerStroops: 1,
+};
+
+/** Network fee conditions a consumer may face. */
+export interface NetworkFeeConditions {
+  /** Flat per-transaction base fee, in stroops. */
+  baseFeeStroops: number;
+  /** Fee per CPU instruction, in stroops. */
+  feePerInstructionStroops: number;
+  /** Fee per ledger byte, in stroops. */
+  feePerByteStroops: number;
+  /** Storage rent per ledger entry per ledger, in stroops. */
+  rentPerEntryPerLedgerStroops: number;
+}
+
+export interface ConsumerCostParams {
+  /** Number of feeds the consumer reads/writes in one call (>= 1). */
   feedCount: number;
-  /** Baseline feed count the observation was calibrated against. */
-  baselineFeedCount?: number;
-  /** Provider load factor: 1.0 = nominal, >1 = loaded, <1 = idle. */
-  providerLoad: number;
-  /** Forecast horizon in hours (default 24). */
-  horizonHours?: number;
-  /** Expected traffic growth over the horizon (1.0 = flat, default 1.0). */
-  trafficGrowthFactor?: number;
-  /** Daily budget for the region; defaults to the sum of source budgets. */
-  dailyBudgetCalls?: number;
+  /** Network fee conditions; defaults to DEFAULT_FEE_CONDITIONS. */
+  feeConditions?: Partial<NetworkFeeConditions>;
+  /** How many ledgers the storage entry must remain live. Default 1. */
+  retentionLedgers?: number;
+  /** Fee the consumer is willing to pay, in stroops. Optional. */
+  maxFeeStroops?: number;
 }
 
-export interface RegionalCapacityForecast {
-  region: string;
-  forecastCalls: number;
-  lowerBoundCalls: number;
-  upperBoundCalls: number;
-  /** Fraction of the daily budget consumed by the forecast (0..1+). */
-  utilization: number;
-  /** Remaining budget after the forecast; negative = projected exhaustion. */
-  headroomCalls: number;
-  /** Headroom as a fraction of the budget (may be negative). */
-  headroomRatio: number;
-  /** True when the upper bound exceeds the budget. */
-  atRisk: boolean;
-  degradedInputs: string[];
+export interface ConsumerCostEstimate {
+  feedCount: number;
+  /** Estimated storage cost (rent) in stroops. */
+  storageStroops: number;
+  /** Estimated transaction fee in stroops. */
+  transactionStroops: number;
+  /** storageStroops + transactionStroops. */
+  totalStroops: number;
+  /** Total cost in XLM. */
+  totalXlm: number;
+  /** True when maxFeeStroops was supplied and totalStroops exceeds it. */
+  insufficientFee: boolean;
+  /** Populated when the inputs are invalid or the fee is insufficient. */
+  error?: string;
 }
 
-/** Relative half-width of the uncertainty band at a 1-hour horizon. */
-export const FORECAST_BASE_UNCERTAINTY = 0.1;
-/** Additional relative uncertainty per extra forecast hour. */
-export const FORECAST_UNCERTAINTY_PER_HOUR = 0.01;
-/** Weight applied to feed-count deltas in the forecast. */
-export const FORECAST_FEED_COUNT_WEIGHT = 0.5;
-/** Weight applied to provider-load deltas in the forecast. */
-export const FORECAST_PROVIDER_LOAD_WEIGHT = 0.25;
+/** Maximum feeds a single consumer call may touch (Soroban footprint cap). */
+export const MAX_CONSUMER_FEEDS = 100;
 
-function defaultRegionalBudget(): number {
-  return Object.values(DAILY_BUDGET_CALLS).reduce((sum, b) => sum + b, 0);
+function resolveFeeConditions(overrides?: Partial<NetworkFeeConditions>): NetworkFeeConditions {
+  return { ...DEFAULT_FEE_CONDITIONS, ...(overrides ?? {}) };
 }
 
-function finiteOr(value: number, fallback: number): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+function validateConsumerParams(params: ConsumerCostParams): string | undefined {
+  const { feedCount, retentionLedgers } = params;
+  if (!Number.isInteger(feedCount) || feedCount < 1) {
+    return `feedCount must be an integer >= 1 (got ${feedCount})`;
+  }
+  if (feedCount > MAX_CONSUMER_FEEDS) {
+    return `feedCount ${feedCount} exceeds the consumer footprint cap of ${MAX_CONSUMER_FEEDS}`;
+  }
+  if (retentionLedgers !== undefined && (!Number.isInteger(retentionLedgers) || retentionLedgers < 1)) {
+    return `retentionLedgers must be an integer >= 1 (got ${retentionLedgers})`;
+  }
+  const fees = resolveFeeConditions(params.feeConditions);
+  for (const [name, value] of Object.entries(fees)) {
+    if (!Number.isFinite(value) || value < 0) {
+      return `fee condition '${name}' must be a finite number >= 0 (got ${value})`;
+    }
+  }
+  return undefined;
 }
 
-/**
- * Forecast regional capacity and headroom with an uncertainty range.
- * Pure function: does not read or mutate counters, so it is safe to call from
- * /health, dashboards and tests.
- */
-export function forecastRegionalCapacity(input: RegionalCapacityInput): RegionalCapacityForecast {
-  const degradedInputs: string[] = [];
-
-  const region = typeof input.region === 'string' && input.region ? input.region : 'unknown';
-  if (region === 'unknown') degradedInputs.push('region');
-
-  let observedCallsPerHour = finiteOr(input.observedCallsPerHour, 0);
-  if (observedCallsPerHour < 0) {
-    degradedInputs.push('observedCallsPerHour');
-    observedCallsPerHour = 0;
-  }
-
-  let feedCount = finiteOr(input.feedCount, 0);
-  if (feedCount < 0) {
-    degradedInputs.push('feedCount');
-    feedCount = 0;
-  }
-
-  const baselineFeedCount = finiteOr(input.baselineFeedCount ?? feedCount, feedCount);
-  let providerLoad = finiteOr(input.providerLoad, 1);
-  if (providerLoad < 0) {
-    degradedInputs.push('providerLoad');
-    providerLoad = 0;
-  }
-
-  let horizonHours = finiteOr(input.horizonHours ?? 24, 24);
-  if (horizonHours <= 0) {
-    degradedInputs.push('horizonHours');
-    horizonHours = 24;
-  }
-
-  let trafficGrowthFactor = finiteOr(input.trafficGrowthFactor ?? 1, 1);
-  if (trafficGrowthFactor < 0) {
-    degradedInputs.push('trafficGrowthFactor');
-    trafficGrowthFactor = 1;
-  }
-
-  const budget = finiteOr(input.dailyBudgetCalls ?? defaultRegionalBudget(), 0);
-  if (budget <= 0) degradedInputs.push('dailyBudgetCalls');
-
-  const feedDelta = baselineFeedCount > 0 ? (feedCount - baselineFeedCount) / baselineFeedCount : 0;
-  const feedFactor = Math.max(0, 1 + FORECAST_FEED_COUNT_WEIGHT * feedDelta);
-  const loadFactor = Math.max(0, 1 + FORECAST_PROVIDER_LOAD_WEIGHT * (providerLoad - 1));
-
-  const forecastCalls = observedCallsPerHour * horizonHours * trafficGrowthFactor * feedFactor * loadFactor;
-
-  const relativeUncertainty =
-    FORECAST_BASE_UNCERTAINTY +
-    FORECAST_UNCERTAINTY_PER_HOUR * Math.max(0, horizonHours - 1) +
-    FORECAST_PROVIDER_LOAD_WEIGHT * Math.max(0, providerLoad - 1);
-  const band = forecastCalls * relativeUncertainty;
-
-  const lowerBoundCalls = Math.max(0, forecastCalls - band);
-  const upperBoundCalls = forecastCalls + band;
-  const utilization = budget > 0 ? forecastCalls / budget : 0;
-  const headroomCalls = budget - forecastCalls;
-  const headroomRatio = budget > 0 ? headroomCalls / budget : 0;
-
+function buildEstimate(
+  params: ConsumerCostParams,
+  storageStroops: number,
+  transactionStroops: number,
+): ConsumerCostEstimate {
+  const totalStroops = storageStroops + transactionStroops;
+  const insufficientFee =
+    params.maxFeeStroops !== undefined && Number.isFinite(params.maxFeeStroops) && totalStroops > params.maxFeeStroops;
   return {
-    region,
-    forecastCalls,
-    lowerBoundCalls,
-    upperBoundCalls,
-    utilization,
-    headroomCalls,
-    headroomRatio,
-    atRisk: budget > 0 && upperBoundCalls > budget,
-    degradedInputs,
+    feedCount: params.feedCount,
+    storageStroops,
+    transactionStroops,
+    totalStroops,
+    totalXlm: totalStroops / STROOPS_PER_XLM,
+    insufficientFee,
+    ...(insufficientFee
+      ? { error: `Estimated cost ${totalStroops} stroops exceeds maxFeeStroops ${params.maxFeeStroops}` }
+      : {}),
   };
 }
 
-/** Forecast every region in one pass, keyed by region id. */
-export function forecastRegions(inputs: RegionalCapacityInput[]): Record<string, RegionalCapacityForecast> {
-  const out: Record<string, RegionalCapacityForecast> = {};
-  for (const input of inputs) {
-    const forecast = forecastRegionalCapacity(input);
-    out[forecast.region] = forecast;
+/**
+ * Estimate the storage (rent) cost of persisting `feedCount` feed entries for
+ * `retentionLedgers` ledgers. Linear in feed count; invalid inputs yield a
+ * zero estimate carrying an `error` so callers can surface it.
+ */
+export function estimateConsumerStorageCost(params: ConsumerCostParams): ConsumerCostEstimate {
+  const error = validateConsumerParams(params);
+  if (error) {
+    return { feedCount: params.feedCount, storageStroops: 0, transactionStroops: 0, totalStroops: 0, totalXlm: 0, insufficientFee: false, error };
   }
-  return out;
+  const fees = resolveFeeConditions(params.feeConditions);
+  const retention = params.retentionLedgers ?? 1;
+  const storageStroops = params.feedCount * fees.rentPerEntryPerLedgerStroops * retention;
+  return buildEstimate(params, storageStroops, 0);
+}
+
+/**
+ * Estimate the transaction fee of a single consumer read of `feedCount` feeds
+ * under the given network fee conditions.
+ */
+export function estimateConsumerReadCost(params: ConsumerCostParams): ConsumerCostEstimate {
+  const error = validateConsumerParams(params);
+  if (error) {
+    return { feedCount: params.feedCount, storageStroops: 0, transactionStroops: 0, totalStroops: 0, totalXlm: 0, insufficientFee: false, error };
+  }
+  const fees = resolveFeeConditions(params.feeConditions);
+  const instructions = params.feedCount * BENCH_READ_INSTRUCTIONS_PER_FEED;
+  const bytes = BENCH_TX_ENVELOPE_BYTES + params.feedCount * BENCH_STORAGE_BYTES_PER_FEED;
+  const transactionStroops =
+    fees.baseFeeStroops + instructions * fees.feePerInstructionStroops + bytes * fees.feePerByteStroops;
+  return buildEstimate(params, 0, transactionStroops);
+}
+
+/**
+ * Estimate the full cost of a consumer write (persist) of `feedCount` feeds:
+ * transaction fee plus storage rent for the retained entries.
+ */
+export function estimateConsumerWriteCost(params: ConsumerCostParams): ConsumerCostEstimate {
+  const error = validateConsumerParams(params);
+  if (error) {
+    return { feedCount: params.feedCount, storageStroops: 0, transactionStroops: 0, totalStroops: 0, totalXlm: 0, insufficientFee: false, error };
+  }
+  const fees = resolveFeeConditions(params.feeConditions);
+  const retention = params.retentionLedgers ?? 1;
+  const instructions = params.feedCount * BENCH_WRITE_INSTRUCTIONS_PER_FEED;
+  const bytes = BENCH_TX_ENVELOPE_BYTES + params.feedCount * BENCH_STORAGE_BYTES_PER_FEED;
+  const transactionStroops =
+    fees.baseFeeStroops + instructions * fees.feePerInstructionStroops + bytes * fees.feePerByteStroops;
+  const storageStroops = params.feedCount * fees.rentPerEntryPerLedgerStroops * retention;
+  return buildEstimate(params, storageStroops, transactionStroops);
+}
+
+export interface ConsumerCostMatrix {
+  feedCounts: number[];
+  feeConditions: NetworkFeeConditions;
+  reads: ConsumerCostEstimate[];
+  writes: ConsumerCostEstimate[];
+}
+
+/**
+ * Reproducible estimate matrix across representative feed counts (1, 10, 50,
+ * and the MAX_CONSUMER_FEEDS boundary) for the given fee conditions. Used by
+ * the benchmark/reporting procedure and tests.
+ */
+export function estimateConsumerCostMatrix(
+  feeConditions?: Partial<NetworkFeeConditions>,
+  feedCounts: number[] = [1, 10, 50, MAX_CONSUMER_FEEDS],
+): ConsumerCostMatrix {
+  const resolved = resolveFeeConditions(feeConditions);
+  return {
+    feedCounts,
+    feeConditions: resolved,
+    reads: feedCounts.map((feedCount) => estimateConsumerReadCost({ feedCount, feeConditions: resolved })),
+    writes: feedCounts.map((feedCount) => estimateConsumerWriteCost({ feedCount, feeConditions: resolved })),
+  };
 }
 
 export interface CostModelIntegrityResult {
