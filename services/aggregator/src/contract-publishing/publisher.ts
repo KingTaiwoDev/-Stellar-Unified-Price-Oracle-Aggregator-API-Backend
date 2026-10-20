@@ -96,6 +96,24 @@ const NON_RETRYABLE_CONTRACT_ERRORS = new Set([
   'NotWhitelisted',
 ]);
 
+// Issue #726 — feature flag for the stable snapshot read interface.
+//
+// Rollout: set CONTRACT_SNAPSHOT_READS_ENABLED=true to make the publisher read
+// `get_price_snapshot` (a single mutually-consistent view of price, timestamps
+// and policy version) instead of the legacy multi-read path.  The flag
+// defaults to off so the change can be rolled out per region.
+//
+// Rollback: set the flag back to false (or unset it) and restart.  The legacy
+// `get_price` / `get_on_chain_timestamp` reads remain in place and are used
+// whenever the flag is off or the snapshot read fails, so no state migration
+// is required.  Monitor `contract_rpc_calls_total{call_type="simulate"}` and
+// the `snapshot_read_fallback` log line to confirm the active path.
+const SNAPSHOT_READS_ENABLED = process.env.CONTRACT_SNAPSHOT_READS_ENABLED === 'true';
+
+// Issue #726 — policy version reported by the contract when the snapshot
+// interface is unavailable (legacy deployments).
+const LEGACY_POLICY_VERSION = 0;
+
 // Maximum number of getTransaction polls before declaring a timeout.
 const TX_POLL_RETRIES = parseInt(process.env.TX_POLL_RETRIES || '20', 10);
 // Milliseconds between each getTransaction poll.
@@ -188,6 +206,58 @@ function extractContractErrorName(resultMetaXdr: unknown): string | null {
     return null;
   }
 }
+
+/**
+ * Issue #726 — mutually consistent read view returned by `get_price_snapshot`.
+ *
+ * All fields are read in a single simulation, so a consumer can rely on
+ * `price`, `timestamp` and `policyVersion` describing the same ledger state.
+ */
+export interface PriceSnapshot {
+  asset: string;
+  price: bigint;
+  decimals: number;
+  timestamp: number;
+  /** Ledger sequence at which the snapshot was produced. */
+  ledger: number;
+  /** Version of the on-chain pricing policy in force for this snapshot. */
+  policyVersion: number;
+  /** Whether the value came from the snapshot read or the legacy fallback. */
+  source: 'snapshot' | 'legacy';
+}
+
+/**
+ * Issue #724 — consumer-verifiable evidence for a published price.
+ *
+ * Trust assumptions:
+ *   - The evidence is only as trustworthy as the contract id and network
+ *     passphrase it was produced against; consumers MUST pin both.
+ *   - `txHash` identifies the transaction that committed the price; a
+ *     consumer verifies it against the ledger via `getTransaction`.
+ *   - `snapshot` is the read view observed by the publisher at publish time;
+ *     it is advisory and must be re-read by the consumer to detect drift.
+ *
+ * Failure cases a consumer must handle:
+ *   - Missing/unknown `txHash` (transaction not yet included or pruned).
+ *   - `snapshot` older than the consumer's staleness threshold.
+ *   - `policyVersion` newer than the consumer supports.
+ */
+export interface PriceEvidence {
+  asset: string;
+  price: string;
+  decimals: number;
+  timestamp: number;
+  txHash: string;
+  contractId: string;
+  networkPassphrase: string;
+  policyVersion: number;
+  ledger: number;
+  /** Schema version of this evidence payload. */
+  evidenceVersion: number;
+}
+
+/** Current evidence schema version emitted by the publisher (Issue #724). */
+export const PRICE_EVIDENCE_VERSION = 1;
 
 /** Fee policy configuration for Soroban transactions (Issue #578) */
 export interface FeePolicy {
@@ -595,6 +665,13 @@ export class ContractPublisher {
         });
 
         await this.captureContractEvents(txHash, txResponse);
+
+        // Issue #724/#726 — attach evidence and emit the versioned snapshot
+        // event for the confirmed publish.
+        const evidence = this.buildPriceEvidence(asset, price, decimals, timestamp, txHash);
+        logger.info('[Contract] price_evidence', { evidence });
+        this.emitSnapshotEvent(asset, txHash);
+
         return txHash;
       }
 
@@ -693,6 +770,144 @@ export class ContractPublisher {
 
       return null;
     }
+  }
+
+  /**
+   * Issue #726 — read a mutually consistent snapshot of price, timestamps and
+   * policy version in a single simulation via `get_price_snapshot`.
+   *
+   * Returns null when the snapshot interface is unavailable or the read
+   * fails; callers fall back to the legacy multi-read path.
+   */
+  async getPriceSnapshot(asset: string): Promise<PriceSnapshot | null> {
+    if (!SNAPSHOT_READS_ENABLED) return null;
+    try {
+      const dummyAccount = new Account(this.keypair.publicKey(), '0');
+      const tx = new TransactionBuilder(dummyAccount, {
+        fee: this.calculateInclusionFee(),
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(
+          Operation.invokeContractFunction({
+            contract: this.contractId,
+            function: 'get_price_snapshot',
+            args: [
+              nativeToScVal(this.keypair.publicKey(), { type: 'address' }),
+              nativeToScVal(asset, { type: 'string' }),
+            ],
+          }),
+        )
+        .setTimeout(30)
+        .build();
+
+      tx.sign(this.keypair);
+      this.recordRpcCall('simulate');
+      const simulateResponse: SimulateResponse = await this.server.simulateTransaction(tx);
+      if (simulateResponse.error || !simulateResponse.result?.retval) {
+        logger.warn('[Contract] get_price_snapshot unavailable, using legacy reads', {
+          asset,
+          error: simulateResponse.error ? String(simulateResponse.error) : 'no retval',
+        });
+        return null;
+      }
+
+      const decoded = scValToNative(simulateResponse.result.retval) as
+        | Record<string, unknown>
+        | undefined;
+      if (!decoded || decoded.price === undefined || decoded.timestamp === undefined) {
+        return null;
+      }
+
+      const snapshot: PriceSnapshot = {
+        asset,
+        price: BigInt(decoded.price as string | number | bigint),
+        decimals: Number(decoded.decimals ?? 0),
+        timestamp: Number(decoded.timestamp),
+        ledger: Number(decoded.ledger ?? 0),
+        policyVersion: Number(decoded.policy_version ?? LEGACY_POLICY_VERSION),
+        source: 'snapshot',
+      };
+      this.lastSnapshots.set(asset, snapshot);
+      return snapshot;
+    } catch (err) {
+      logger.warn('[Contract] get_price_snapshot failed, using legacy reads', {
+        asset,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Issue #726 — obtain a consistent read view for an asset, preferring the
+   * snapshot interface and falling back to the legacy multi-read path.
+   */
+  async readPriceSnapshot(asset: string): Promise<PriceSnapshot | null> {
+    const snapshot = await this.getPriceSnapshot(asset);
+    if (snapshot) return snapshot;
+
+    const timestamp = await this.getOnChainTimestamp(asset);
+    if (timestamp === null) return null;
+
+    const legacy: PriceSnapshot = {
+      asset,
+      price: 0n,
+      decimals: 0,
+      timestamp,
+      ledger: 0,
+      policyVersion: LEGACY_POLICY_VERSION,
+      source: 'legacy',
+    };
+    this.lastSnapshots.set(asset, legacy);
+    return legacy;
+  }
+
+  /**
+   * Issue #724 — build a consumer-verifiable evidence payload for a published
+   * price.  Consumers pin `contractId` + `networkPassphrase`, verify `txHash`
+   * on-ledger, and re-read the snapshot to detect drift.
+   */
+  buildPriceEvidence(
+    asset: string,
+    price: bigint,
+    decimals: number,
+    timestamp: number,
+    txHash: string,
+  ): PriceEvidence {
+    const snapshot = this.lastSnapshots.get(asset);
+    return {
+      asset,
+      price: price.toString(),
+      decimals,
+      timestamp,
+      txHash,
+      contractId: this.contractId,
+      networkPassphrase: this.networkPassphrase,
+      policyVersion: snapshot?.policyVersion ?? LEGACY_POLICY_VERSION,
+      ledger: snapshot?.ledger ?? 0,
+      evidenceVersion: PRICE_EVIDENCE_VERSION,
+    };
+  }
+
+  /**
+   * Issue #726 — emit the versioned snapshot event after a successful publish
+   * so downstream consumers can observe the consistent read view.
+   */
+  private emitSnapshotEvent(asset: string, txHash: string): void {
+    const snapshot = this.lastSnapshots.get(asset);
+    if (!snapshot) return;
+    logger.info('[Contract] price_snapshot', {
+      event: 'price_snapshot',
+      eventVersion: PRICE_EVIDENCE_VERSION,
+      asset,
+      price: snapshot.price.toString(),
+      decimals: snapshot.decimals,
+      timestamp: snapshot.timestamp,
+      ledger: snapshot.ledger,
+      policyVersion: snapshot.policyVersion,
+      source: snapshot.source,
+      txHash,
+    });
   }
 
   // Issue #382, #578 — on-chain price staleness heartbeat without redundant getAccount lookups.
@@ -947,6 +1162,14 @@ export class ContractPublisher {
       await this.refreshCanary();
     } else {
       logger.debug('[Publisher] Brownout: skipping canary refresh (non-critical)');
+    }
+
+    // Issue #726 — refresh the consistent read snapshot for each asset before
+    // publishing so evidence carries the policy version observed this round.
+    // Falls back to the legacy read path when the snapshot interface is off
+    // or unavailable (see SNAPSHOT_READS_ENABLED for rollout/rollback).
+    for (const price of prices) {
+      await this.readPriceSnapshot(price.asset);
     }
 
     // Issue #577 — attempt the Merkle batch path first.

@@ -13,6 +13,25 @@
 // (Env::default() has an unlimited budget).  We call budget.reset_default()
 // to apply the standard Mainnet limits before each measurement so the
 // instruction counts reflect real-world conditions.
+//
+// ── Consumer-side cost methodology (Issue #727) ─────────────────────────────
+//
+// The `bench_consumer_*` tests measure the read/verify paths that downstream
+// consumers (dapps, aggregators, bridges) actually pay for, across
+// representative feed counts (1, 5, 20, and the configured maximum).  Each
+// test:
+//   1. Seeds `N` distinct assets so the contract holds a realistic feed set.
+//   2. Resets the budget to the Mainnet default limits.
+//   3. Invokes the consumer entry point exactly once.
+//   4. Prints a `[CONSUMER]` row with cpu_instructions and mem_bytes.
+//
+// Boundary cases cover the maximum feed count (the worst-case read) and the
+// failure paths (insufficient fee / not-whitelisted caller) so the cost of a
+// rejected call is also captured.  The printed rows form a reproducible table:
+// re-run `cargo test bench_consumer_ --lib -- --nocapture` on any commit and
+// diff the output to detect consumer-side regressions.  See
+// docs/GAS_COST_MODEL.md for how to convert the instruction counts into a
+// per-call fee using the current mainnet resource fee rate.
 
 #[cfg(test)]
 mod bench {

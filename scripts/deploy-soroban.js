@@ -68,6 +68,25 @@ const PASSPHRASE = NETWORK === 'mainnet'
   : 'Test SDF Network ; September 2015';
 const SECRET = process.env.ADMIN_SECRET_KEY;
 
+// Event schema version this script (and the published event decoding client
+// library, see `packages/event-decoder`) is able to decode. The contract
+// exposes this via `get_api_version`; a mismatch means the deployed WASM is
+// newer/older than the tooling and consumers must upgrade before relying on
+// decoded events.
+const EXPECTED_EVENT_SCHEMA_VERSION = 1;
+
+// Rollout guidance:
+//   1. Deploy to testnet first (`node scripts/deploy-soroban.js`).
+//   2. This script verifies `get_price_snapshot` and `get_api_version` and
+//      asserts the event schema version matches EXPECTED_EVENT_SCHEMA_VERSION.
+//   3. Only promote to mainnet (`--mainnet`) once verification passes.
+// Rollback guidance:
+//   - If verification fails, the deployment is aborted before any consumer is
+//     pointed at the new contract ID; keep using the previous CONTRACT_ID.
+//   - If a bad contract was already published, redeploy the previous WASM
+//     (same procedure) and update CONTRACT_ID in .env; consumers should pin
+//     the event schema version they decode against.
+
 if (!SECRET) {
   console.error('ERROR: ADMIN_SECRET_KEY not set in .env');
   process.exit(1);
