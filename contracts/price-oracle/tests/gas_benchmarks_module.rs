@@ -39,127 +39,74 @@ mod compilation_verification {
     }
 }
 
-// Reproducible consumer-side cost estimation for CI.
+// Feed-population sweep integration tests (#732).
 //
-// These tests exercise the consumer cost model exposed by the price-oracle
-// crate and assert that a full cost table is produced for:
-//   * normal operation (representative feed counts and fee conditions),
-//   * the boundary case (maximum supported feed count),
-//   * the failure case (insufficient fee budget).
-//
-// The assertions are deterministic and depend only on the crate's own cost
-// constants, so the resulting table can be diffed across runs to detect
-// regressions in storage/transaction cost estimates.
+// These tests drive the benchmark sweep defined in the `gas_benchmarks`
+// module across a growing set of feed populations and assert that every
+// recorded measurement stays within the published operating envelope
+// (see `docs/gas-benchmarks.md`). They cover the normal populations, the
+// boundary population (the largest supported feed count) and the failure
+// case (a population above the supported envelope must be rejected).
 #[cfg(test)]
-mod consumer_cost_estimates {
+mod feed_population_sweep {
     use price_oracle::gas_benchmarks::{
-        estimate_consumer_costs, ConsumerCostEstimate, ConsumerCostError, ConsumerCostTable,
-        MAX_BENCHMARK_FEEDS,
+        run_feed_population_sweep, sweep_populations, BudgetEnvelope, SweepError,
+        MAX_SUPPORTED_FEEDS,
     };
 
-    /// Representative feed counts used for the "normal" scenario.
-    const NORMAL_FEED_COUNTS: [u32; 3] = [1, 5, 10];
-
-    /// Representative network fee conditions (stroops per operation).
-    const NORMAL_FEE_CONDITIONS: [u32; 3] = [100, 1_000, 10_000];
-
-    fn assert_estimate_is_well_formed(estimate: &ConsumerCostEstimate) {
-        assert!(
-            estimate.storage_bytes > 0,
-            "storage estimate must be positive for {} feeds",
-            estimate.feed_count
-        );
-        assert!(
-            estimate.transaction_fee_stroops > 0,
-            "transaction fee estimate must be positive for {} feeds",
-            estimate.feed_count
-        );
-        assert!(
-            estimate.total_cost_stroops >= estimate.transaction_fee_stroops,
-            "total cost must include the transaction fee"
-        );
-    }
-
+    /// Every population in the published sweep must produce a measurement
+    /// record and each record must satisfy the published budget thresholds.
     #[test]
-    fn normal_cases_produce_cost_table() {
-        let table: ConsumerCostTable = estimate_consumer_costs(
-            &NORMAL_FEED_COUNTS,
-            &NORMAL_FEE_CONDITIONS,
-        )
-        .expect("normal consumer cost estimation should succeed");
+    fn sweep_stays_within_published_budget() {
+        let envelope = BudgetEnvelope::published();
+        let records = run_feed_population_sweep(&envelope)
+            .expect("feed population sweep must complete for supported populations");
 
         assert_eq!(
-            table.estimates.len(),
-            NORMAL_FEED_COUNTS.len() * NORMAL_FEE_CONDITIONS.len(),
-            "cost table must contain one row per (feeds, fee) combination"
+            records.len(),
+            sweep_populations().len(),
+            "sweep must record one measurement per population size"
         );
 
-        for estimate in &table.estimates {
-            assert_estimate_is_well_formed(estimate);
-        }
-
-        // Storage cost must be monotonic in the number of feeds for a fixed
-        // fee condition; this is the core consumer-side scaling property.
-        for &fee in &NORMAL_FEE_CONDITIONS {
-            let mut previous: Option<u64> = None;
-            for &feeds in &NORMAL_FEED_COUNTS {
-                let row = table
-                    .estimates
-                    .iter()
-                    .find(|e| e.feed_count == feeds && e.fee_stroops == fee)
-                    .expect("row for (feeds, fee) must exist");
-                if let Some(prev) = previous {
-                    assert!(
-                        row.storage_bytes >= prev,
-                        "storage estimate must be non-decreasing in feed count"
-                    );
-                }
-                previous = Some(row.storage_bytes);
-            }
+        for record in &records {
+            assert!(
+                envelope.within_budget(record),
+                "population {} exceeded published budget: {:?}",
+                record.feed_count,
+                record
+            );
         }
     }
 
+    /// The sweep must be monotonic in population size and include the
+    /// boundary population exactly once.
     #[test]
-    fn boundary_case_max_feeds_produces_cost_table() {
-        let table = estimate_consumer_costs(&[MAX_BENCHMARK_FEEDS], &[1_000])
-            .expect("boundary consumer cost estimation should succeed");
-
-        assert_eq!(table.estimates.len(), 1);
-        let estimate = &table.estimates[0];
-        assert_eq!(estimate.feed_count, MAX_BENCHMARK_FEEDS);
-        assert_estimate_is_well_formed(estimate);
-    }
-
-    #[test]
-    fn failure_case_insufficient_fee_is_reported() {
-        // A zero fee budget cannot cover any consumer read/write.
-        let result = estimate_consumer_costs(&[1], &[0]);
+    fn sweep_covers_boundary_population() {
+        let populations = sweep_populations();
+        assert!(
+            populations.windows(2).all(|w| w[0] < w[1]),
+            "sweep populations must be strictly increasing"
+        );
         assert_eq!(
-            result,
-            Err(ConsumerCostError::InsufficientFee),
-            "zero fee budget must be reported as insufficient"
+            *populations.last().expect("sweep must be non-empty"),
+            MAX_SUPPORTED_FEEDS,
+            "sweep must include the maximum supported feed population"
         );
     }
 
+    /// A population above the supported envelope must be rejected rather
+    /// than silently measured.
     #[test]
-    fn failure_case_exceeding_max_feeds_is_reported() {
-        let result = estimate_consumer_costs(&[MAX_BENCHMARK_FEEDS + 1], &[1_000]);
+    fn sweep_rejects_population_above_envelope() {
+        let envelope = BudgetEnvelope::published();
+        let result = run_feed_population_sweep_for(MAX_SUPPORTED_FEEDS + 1, &envelope);
         assert_eq!(
             result,
-            Err(ConsumerCostError::TooManyFeeds),
-            "feed counts above the maximum must be rejected"
-        );
-    }
-
-    #[test]
-    fn cost_table_is_reproducible() {
-        let first = estimate_consumer_costs(&NORMAL_FEED_COUNTS, &NORMAL_FEE_CONDITIONS)
-            .expect("first run should succeed");
-        let second = estimate_consumer_costs(&NORMAL_FEED_COUNTS, &NORMAL_FEE_CONDITIONS)
-            .expect("second run should succeed");
-        assert_eq!(
-            first, second,
-            "cost estimates must be deterministic across runs"
+            Err(SweepError::PopulationAboveEnvelope {
+                requested: MAX_SUPPORTED_FEEDS + 1,
+                max_supported: MAX_SUPPORTED_FEEDS,
+            }),
+            "populations above the envelope must be rejected"
         );
     }
 }

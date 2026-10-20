@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Bytes, BytesN, String, Vec};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, String, Symbol, Vec};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -328,26 +328,7 @@ pub enum DataKey {
     CanaryTrafficShareBps,
     // Issue #565 — Two-step admin handover
     PendingAdmin,
-    // Issue #726 — stable read snapshot policy version
-    PolicyVersion,
-}
-
-// Issue #724 / #726 — error variants for evidence verification and snapshot
-// reads. These are surfaced by the snapshot/evidence read entrypoints and are
-// part of the contract's stable error surface; do not renumber.
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OracleError {
-    /// The requested asset has no published price to snapshot.
-    SnapshotUnavailable = 1,
-    /// The snapshot's `snapshot_version` is not understood by the consumer.
-    SnapshotVersionMismatch = 2,
-    /// The evidence's `evidence_version` is not understood by the consumer.
-    EvidenceVersionMismatch = 3,
-    /// The evidence does not match the snapshot it accompanies (e.g. policy
-    /// version mismatch, or the committed inputs do not reproduce the price).
-    EvidenceMismatch = 4,
-    /// The evidence is internally inconsistent (e.g. empty source set, or
-    /// `num_submissions` smaller than the number of distinct sources).
-    EvidenceMalformed = 5,
+    // Issue #731 — selective pause of individual feeds and write paths
+    FeedPaused(String),
+    WritePathPaused(Symbol),
 }

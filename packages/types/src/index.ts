@@ -110,258 +110,114 @@ export interface HistoricalPriceEntry {
   timestamp: number;
 }
 
-// ── Contract read snapshot (consumer-facing) ─────────────────────────────────
+// ── Consumer data product types (issues #715-#718) ─────────────────────────────
 
-/**
- * A mutually consistent view of a published price, its timestamps, and the
- * policy version that governed the publication.
- *
- * Mirrors the contract's `PriceSnapshot` struct. All fields are read in a
- * single contract invocation, so consumers never observe a price paired with
- * a timestamp or policy version from a different publication.
- */
-export interface PriceSnapshot {
+/** Consumer-supplied or derived geographic region for latency/freshness grouping. */
+export type ConsumerRegion = string;
+
+/** A single measured delivery sample: how long a price took to reach the consumer
+ *  and how fresh it was at serve time. */
+export interface LatencySample {
   asset: string;
-  /** Price scaled by `10^decimals`, as a decimal string. */
+  region: ConsumerRegion;
+  /** Price observation timestamp, Unix seconds (provider's observedAt when present). */
+  observedAt: number;
+  /** When the API delivered the response, Unix seconds. */
+  deliveredAt: number;
+  /** End-to-end delivery latency in milliseconds. */
+  latencyMs: number;
+  /** Data age at delivery in milliseconds (deliveredAt - price.timestamp). */
+  freshnessMs: number;
+  source?: OracleSourceName;
+}
+
+/** Percentile summary for a numeric distribution. */
+export interface PercentileSummary {
+  p50: number;
+  p95: number;
+  p99: number;
+  mean: number;
+  max: number;
+  count: number;
+}
+
+/** Latency + freshness stats for one (asset, region) feed over a sample window. */
+export interface FeedLatencyFreshnessStats {
+  asset: string;
+  region: ConsumerRegion;
+  windowStart: number; // Unix seconds
+  windowEnd: number;   // Unix seconds
+  sampleCount: number;
+  latency: PercentileSummary;
+  freshness: PercentileSummary & { staleCount: number };
+  methodology: string;
+}
+
+/** One usage record exported to the calling consumer (tenant-scoped). */
+export interface UsageExportRecord {
+  endpoint: string;
+  method: string;
+  asset?: string;
+  status: number;
+  timestamp: number; // Unix seconds
+}
+
+/** Machine-readable usage export for the authenticated consumer only. */
+export interface UsageExport {
+  keyPrefix: string;
+  windowStart: number; // Unix seconds
+  windowEnd: number;   // Unix seconds
+  totalRequests: number;
+  byEndpoint: Record<string, number>;
+  byAsset: Record<string, number>;
+  byStatus: Record<string, number>;
+  records: UsageExportRecord[];
+  generatedAt: number; // Unix seconds
+}
+
+/** A contracted consumer delivery objective (SLO/SLA). */
+export interface DeliveryObjective {
+  id: string;
+  name: string;
+  description: string;
+  metric: 'latency' | 'freshness' | 'uptime' | 'availability';
+  target: number;
+  unit: 'ms' | 'seconds' | 'percent';
+  window: '1h' | '24h' | '7d' | '30d';
+}
+
+/** Measured attainment of a delivery objective, with exclusions and incidents. */
+export interface DeliveryObjectiveAttainment {
+  objective: DeliveryObjective;
+  attained: boolean;
+  actual: number;
+  target: number;
+  unit: 'ms' | 'seconds' | 'percent';
+  exclusions: Array<{ reason: string; from: number; to: number }>;
+  incidentWindows: Array<{ id: string; from: number; to: number; reason: string }>;
+  calculation: string; // human-readable, auditable description of the calculation
+}
+
+/** Price-provenance response linking a price to its production lineage. */
+export interface PriceProvenance {
+  asset: string;
   price: string;
   decimals: number;
-  /** Provider observation time, in Unix seconds. */
-  observedAt: number;
-  /** Ledger time at which the snapshot was published, in Unix seconds. */
-  publishedAt: number;
-  /** Monotonic publication sequence number; strictly increases per asset. */
-  sequence: number;
-  /** Policy version in force when this snapshot was published. */
-  policyVersion: number;
-  /** True when the age of this price was independently verifiable. */
-  ageVerified: boolean;
-}
-
-// ── Consumer-verifiable price evidence ───────────────────────────────────────
-
-/**
- * Evidence a consumer can independently verify against a published price.
- *
- * Mirrors the contract's `PriceEvidence` struct. Verification requires the
- * consumer to trust only the contract id and the network passphrase; every
- * other input is covered by `digest`.
- */
-export interface PriceEvidence {
-  asset: string;
-  price: string;
-  decimals: number;
-  observedAt: number;
-  publishedAt: number;
-  sequence: number;
-  policyVersion: number;
-  /** Oracle sources that contributed to the published price. */
-  sources: OracleSourceName[];
-  /** Hex-encoded SHA-256 digest over the canonical evidence encoding. */
-  digest: string;
-  /** Hex-encoded signature over `digest` by the publishing key. */
-  signature: string;
-  /** Public key (G...) of the publisher that produced `signature`. */
-  publisher: string;
-}
-
-// ── Versioned contract events ────────────────────────────────────────────────
-
-/** Event schema versions this library can decode. */
-export const SUPPORTED_EVENT_VERSIONS = [1] as const;
-
-export type SupportedEventVersion = (typeof SUPPORTED_EVENT_VERSIONS)[number];
-
-/** Highest event schema version understood by this library. */
-export const LATEST_EVENT_VERSION: SupportedEventVersion = 1;
-
-export interface ContractEventBase {
-  /** Event schema version; used for compatibility checks. */
-  version: number;
-  /** Contract that emitted the event. */
-  contractId: string;
-  /** Ledger sequence in which the event was emitted. */
-  ledger: number;
-  /** Transaction hash that produced the event, hex-encoded. */
-  txHash: string;
-}
-
-export interface PriceSubmittedEventV1 extends ContractEventBase {
-  version: 1;
-  type: 'price_submitted';
-  asset: string;
-  price: string;
-  decimals: number;
-  source: OracleSourceName;
-  observedAt: number;
-}
-
-export interface PriceSnapshotPublishedEventV1 extends ContractEventBase {
-  version: 1;
-  type: 'price_snapshot_published';
-  asset: string;
-  price: string;
-  decimals: number;
-  observedAt: number;
-  publishedAt: number;
-  sequence: number;
-  policyVersion: number;
-  ageVerified: boolean;
-}
-
-export interface PolicyVersionUpdatedEventV1 extends ContractEventBase {
-  version: 1;
-  type: 'policy_version_updated';
-  previousVersion: number;
-  newVersion: number;
-}
-
-export type ContractEventV1 =
-  | PriceSubmittedEventV1
-  | PriceSnapshotPublishedEventV1
-  | PolicyVersionUpdatedEventV1;
-
-export type ContractEvent = ContractEventV1;
-
-/** Raw Soroban event as delivered by RPC `getEvents`. */
-export interface RawContractEvent {
-  contractId: string;
-  ledger: number;
-  txHash: string;
-  /** Decoded topic values; the first topic carries the event name. */
-  topics: unknown[];
-  /** Decoded event body. */
-  value: unknown;
-}
-
-export class EventDecodeError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'EventDecodeError';
-  }
-}
-
-export class EventVersionError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'EventVersionError';
-  }
-}
-
-/**
- * Throws `EventVersionError` unless `version` is an event schema version this
- * library can decode. Callers should treat a thrown error as "upgrade the
- * client", never as "ignore the event".
- */
-export function checkEventVersionCompatibility(version: number): void {
-  if (!Number.isInteger(version) || version < 1) {
-    throw new EventVersionError(`Invalid event version: ${version}`);
-  }
-  if (!(SUPPORTED_EVENT_VERSIONS as readonly number[]).includes(version)) {
-    throw new EventVersionError(
-      `Unsupported event version ${version}; supported: ${SUPPORTED_EVENT_VERSIONS.join(', ')}`,
-    );
-  }
-}
-
-function asRecord(value: unknown, what: string): Record<string, unknown> {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    throw new EventDecodeError(`Expected ${what} to be an object`);
-  }
-  return value as Record<string, unknown>;
-}
-
-function asString(value: unknown, what: string): string {
-  if (typeof value !== 'string') {
-    throw new EventDecodeError(`Expected ${what} to be a string`);
-  }
-  return value;
-}
-
-function asNumber(value: unknown, what: string): number {
-  if (typeof value !== 'number' || !Number.isFinite(value)) {
-    throw new EventDecodeError(`Expected ${what} to be a finite number`);
-  }
-  return value;
-}
-
-function asBoolean(value: unknown, what: string): boolean {
-  if (typeof value !== 'boolean') {
-    throw new EventDecodeError(`Expected ${what} to be a boolean`);
-  }
-  return value;
-}
-
-const ORACLE_SOURCES: readonly OracleSourceName[] = [
-  'chainlink',
-  'redstone',
-  'band',
-  'reflector',
-];
-
-function asSource(value: unknown, what: string): OracleSourceName {
-  const source = asString(value, what);
-  if (!ORACLE_SOURCES.includes(source as OracleSourceName)) {
-    throw new EventDecodeError(`Unknown oracle source: ${source}`);
-  }
-  return source as OracleSourceName;
-}
-
-/**
- * Decodes a raw Soroban event into a typed, version-checked record.
- *
- * Throws `EventVersionError` for unsupported schema versions and
- * `EventDecodeError` for malformed payloads. Unknown event names are rejected
- * rather than silently dropped so consumers notice contract upgrades.
- */
-export function decodeContractEvent(raw: RawContractEvent): ContractEvent {
-  const event = asRecord(raw, 'raw event');
-  const contractId = asString(event.contractId, 'contractId');
-  const ledger = asNumber(event.ledger, 'ledger');
-  const txHash = asString(event.txHash, 'txHash');
-
-  if (!Array.isArray(event.topics) || event.topics.length === 0) {
-    throw new EventDecodeError('Event has no topics');
-  }
-  const name = asString(event.topics[0], 'event name topic');
-  const body = asRecord(event.value, 'event value');
-
-  const version = asNumber(body.version, 'version');
-  checkEventVersionCompatibility(version);
-
-  const base = { version: 1 as const, contractId, ledger, txHash };
-
-  switch (name) {
-    case 'price_submitted':
-      return {
-        ...base,
-        type: 'price_submitted',
-        asset: asString(body.asset, 'asset'),
-        price: asString(body.price, 'price'),
-        decimals: asNumber(body.decimals, 'decimals'),
-        source: asSource(body.source, 'source'),
-        observedAt: asNumber(body.observedAt, 'observedAt'),
-      };
-    case 'price_snapshot_published':
-      return {
-        ...base,
-        type: 'price_snapshot_published',
-        asset: asString(body.asset, 'asset'),
-        price: asString(body.price, 'price'),
-        decimals: asNumber(body.decimals, 'decimals'),
-        observedAt: asNumber(body.observedAt, 'observedAt'),
-        publishedAt: asNumber(body.publishedAt, 'publishedAt'),
-        sequence: asNumber(body.sequence, 'sequence'),
-        policyVersion: asNumber(body.policyVersion, 'policyVersion'),
-        ageVerified: asBoolean(body.ageVerified, 'ageVerified'),
-      };
-    case 'policy_version_updated':
-      return {
-        ...base,
-        type: 'policy_version_updated',
-        previousVersion: asNumber(body.previousVersion, 'previousVersion'),
-        newVersion: asNumber(body.newVersion, 'newVersion'),
-      };
-    default:
-      throw new EventDecodeError(`Unknown event type: ${name}`);
-  }
+  timestamp: number; // Unix seconds
+  observedAt: number | null;
+  catalogVersion: string;
+  aggregationPolicy: {
+    strategy: string;
+    sourceCount: number;
+    minSources: number;
+  };
+  sourceSet: OracleSourceName[];
+  observationTimeSemantics: {
+    observedAt?: number | null;
+    fetchedAt?: number | null;
+    /** True only when every contributing source reported its own observation time. */
+    ageVerified: boolean;
+  };
+  provenanceId: string;
+  verificationUrl: string;
 }

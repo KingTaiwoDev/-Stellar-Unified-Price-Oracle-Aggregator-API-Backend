@@ -1,4 +1,5 @@
 import { config, redactedConfigView } from './infrastructure/config';
+import { brownoutPolicy } from './infrastructure/brownout';
 import { tryCatchAsync } from './infrastructure/result';
 import { logger } from './observability/logger';
 import { ChainlinkSource, RedstoneSource, BandSource, ReflectorSource } from './oracle-sources';
@@ -24,6 +25,8 @@ import {
   regionDriftPercent,
   regionPeersConfigured,
   regionPeersReporting,
+  brownoutTierGauge,
+  brownoutShedTotal,
 } from './observability/metrics';
 import { DatabaseClient } from './persistence/database';
 import { BaseSource } from './oracle-sources/base';
@@ -88,6 +91,20 @@ let publisher: ContractPublisher | null = null;
 let shutdownInProgress = false;
 
 async function poll(): Promise<AggregatedPrice[]> {
+  // Issue #741 — evaluate brownout tier at the start of every cycle. Price
+  // freshness and publication are never gated; only non-critical work is shed.
+  const tierChange = brownoutPolicy.evaluate();
+  if (tierChange) {
+    brownoutTierGauge.set({ tier: tierChange.tier }, 1);
+    for (const other of ['full', 'reduced', 'minimal'] as const) {
+      if (other !== tierChange.tier) brownoutTierGauge.set({ tier: other }, 0);
+    }
+    logger[tierChange.tier === 'full' ? 'info' : 'warn'](`[Brownout] Tier ${tierChange.previous} -> ${tierChange.tier}`, {
+      reason: tierChange.reason,
+      shed: brownoutPolicy.getShedFeatures(),
+    });
+  }
+
   const sources: BaseSource[] = pollSources;
   const sourcePricesByAsset: Map<string, { source: string; price: string }[]> = new Map();
   const sourceFetchStarted = performance.now();
@@ -109,23 +126,28 @@ async function poll(): Promise<AggregatedPrice[]> {
       list.push({ source: price.source, price: price.price.toString() });
       sourcePricesByAsset.set(price.asset, list);
 
-      if (db && db.isInitialized()) {
-        await db.appendHistoricalPrice(
-          price.asset,
-          price.price.toString(),
-          price.decimals,
-          price.source,
-          price.timestamp,
-        );
-      } else {
-        try {
-          appendHistoricalPrice(price.asset, price.price.toString(), price.decimals, price.source, price.timestamp);
-        } catch (err) {
-          logger.error('Failed to append historical price for asset', {
-            asset: price.asset,
-            error: err instanceof Error ? err.message : String(err),
-          });
+      // Issue #741 — history persistence is non-critical; shed under reduced/minimal.
+      if (brownoutPolicy.isFeatureEnabled('history_persistence')) {
+        if (db && db.isInitialized()) {
+          await db.appendHistoricalPrice(
+            price.asset,
+            price.price.toString(),
+            price.decimals,
+            price.source,
+            price.timestamp,
+          );
+        } else {
+          try {
+            appendHistoricalPrice(price.asset, price.price.toString(), price.decimals, price.source, price.timestamp);
+          } catch (err) {
+            logger.error('Failed to append historical price for asset', {
+              asset: price.asset,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
         }
+      } else {
+        brownoutShedTotal.inc({ feature: 'history_persistence' });
       }
     }
 
@@ -195,13 +217,16 @@ async function poll(): Promise<AggregatedPrice[]> {
       logger.warn(`[Anomaly] ${ap.asset} score=${ap.anomaly.score.toFixed(3)} method=${ap.anomaly.method}: ${ap.anomaly.details}`);
     }
 
-    // Check price against alert thresholds
+    // Check price against alert thresholds (critical: always runs)
     await alertManager.checkPrice(ap);
 
-    // Check for disagreement between live oracle sources
+    // Check for disagreement between live oracle sources — non-essential
+    // webhook fan-out is shed under brownout, but the check itself is kept.
     const sourcePrices = sourcePricesByAsset.get(ap.asset);
-    if (sourcePrices) {
+    if (sourcePrices && brownoutPolicy.isFeatureEnabled('source_disagreement_alerts')) {
       await alertManager.checkSourceDisagreement(ap.asset, sourcePrices);
+    } else if (sourcePrices) {
+      brownoutShedTotal.inc({ feature: 'source_disagreement_alerts' });
     }
   }
 
@@ -290,7 +315,12 @@ async function poll(): Promise<AggregatedPrice[]> {
   lastAggregated = aggregated;
 
   for (const source of sources) {
-    appendUptimeSnapshot(source.name, source.health);
+    // Issue #741 — uptime history snapshots are non-critical background work.
+    if (brownoutPolicy.isFeatureEnabled('uptime_history')) {
+      appendUptimeSnapshot(source.name, source.health);
+    } else {
+      brownoutShedTotal.inc({ feature: 'uptime_history' });
+    }
     oracleSourceUptimePercent.set({ source: source.name }, source.health.uptimePercent);
   }
 
@@ -400,6 +430,7 @@ async function main(): Promise<void> {
     startupTimeMs,
     onChainHeartbeat,
     ports: resolvedPorts,
+    brownout: brownoutPolicy.getStatus(),
   }));
   healthServer.start();
   logger.info(
@@ -515,7 +546,13 @@ async function main(): Promise<void> {
   // Schedule first self-scheduling recurring tick
   pollTimeout = setTimeout(executeCycle, config.pollingIntervalMs);
 
-  fileArchival.start();
+  // Issue #741 — file archival is a non-critical background job; it is started
+  // only when the current tier permits it and re-evaluated on tier changes.
+  if (brownoutPolicy.isFeatureEnabled('file_archival')) {
+    fileArchival.start();
+  } else {
+    brownoutShedTotal.inc({ feature: 'file_archival' });
+  }
 
   // Issue #579 — one idempotent handler covers SIGTERM and SIGINT.
   const shutdownHooks: ShutdownHooks = {
@@ -563,6 +600,16 @@ async function main(): Promise<void> {
     forceExitMs: config.shutdown.forceExitMs,
   });
   shutdownCoordinator.register(['SIGTERM', 'SIGINT']);
+
+  // Issue #741 — react to tier transitions: start/stop non-critical background
+  // jobs as the tier changes. Price polling and publication are never touched.
+  brownoutPolicy.onTierChange((change) => {
+    if (change.tier === 'full') {
+      fileArchival.start();
+    } else {
+      fileArchival.stop();
+    }
+  });
 }
 
 if (require.main === module) {

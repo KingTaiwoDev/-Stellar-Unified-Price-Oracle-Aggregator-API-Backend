@@ -32,6 +32,7 @@ import { AggregatedPrice } from '../infrastructure/types';
 import { CanaryRollbackGuard, shouldRouteToCanary } from './canary';
 import { SubmissionRetryQueue } from './retry-queue';
 import { MerkleTree, BatchPriceEntry } from '../infrastructure/merkle';
+import { FencingEpochStore, FencingEpochState } from './fencing-epoch';
 
 interface ContractCallLog {
   txHash: string;
@@ -328,17 +329,23 @@ export class ContractPublisher {
   private submissionSequence = 0;
   private canaryRollbackGuard: CanaryRollbackGuard;
 
-  // Issue #724/#726 — most recent snapshot observed per asset, used to attach
-  // evidence to published records.
-  private lastSnapshots: Map<string, PriceSnapshot> = new Map();
+  // Issue #745 — single-publisher fencing epoch.  Every submission carries
+  // the epoch this publisher believes is authoritative; the contract rejects
+  // anything below its own epoch, so a stale or isolated region cannot write
+  // after failover.  The epoch is persisted so a restarted process resumes
+  // with the same authority instead of silently regressing.
+  private fencingEpochStore: FencingEpochStore;
+  private fencingEpoch = 0;
 
-  constructor(feePolicy: Partial<FeePolicy> = {}) {
+  constructor(feePolicy: Partial<FeePolicy> = {}, fencingEpochStore?: FencingEpochStore) {
     this.server = new SorobanRpc.Server(config.soroban.rpcUrl);
     this.keypair = Keypair.fromSecret(config.soroban.adminSecret);
     this.contractId = config.soroban.contractId;
     this.networkPassphrase = config.soroban.networkPassphrase;
     this.feePolicy = { ...DEFAULT_FEE_POLICY, ...feePolicy };
     this.canaryRollbackGuard = new CanaryRollbackGuard(config.canary.failureThreshold);
+    this.fencingEpochStore = fencingEpochStore ?? new FencingEpochStore();
+    this.fencingEpoch = this.fencingEpochStore.load().epoch;
 
     this.retryQueue = new SubmissionRetryQueue({
       maxRetries: 5,
@@ -366,6 +373,62 @@ export class ContractPublisher {
 
   isPublishingEnabled(): boolean {
     return this.publishingEnabled;
+  }
+
+  /** Issue #745 — the epoch this publisher currently claims authority for. */
+  getFencingEpoch(): number {
+    return this.fencingEpoch;
+  }
+
+  /**
+   * Issue #745 — advance the fencing epoch on leader election.
+   *
+   * The new epoch is persisted before it is adopted so a crash mid-promotion
+   * cannot leave the process believing it holds an older epoch than the one
+   * recorded on disk.  Queued submissions from the previous epoch are
+   * discarded: they were produced under authority that is no longer valid and
+   * must be re-aggregated by the new leader rather than replayed.
+   */
+  async advanceFencingEpoch(reason = 'leader_election'): Promise<number> {
+    const previous = this.fencingEpoch;
+    const next = previous + 1;
+    const state: FencingEpochState = {
+      epoch: next,
+      updatedAt: Date.now(),
+      reason,
+    };
+    this.fencingEpochStore.save(state);
+    this.fencingEpoch = next;
+
+    const discarded = this.retryQueue.getQueueSize();
+    if (discarded > 0) {
+      this.retryQueue.discardAll(`fencing_epoch_advanced:${previous}->${next}`);
+    }
+
+    logger.warn('[Publisher] Fencing epoch advanced on leader election', {
+      previousEpoch: previous,
+      epoch: next,
+      reason,
+      discardedSubmissions: discarded,
+    });
+    return next;
+  }
+
+  /**
+   * Issue #745 — reject submissions whose epoch is not the current
+   * authoritative epoch.  Returns true when the submission may proceed.
+   */
+  private admitEpoch(epoch: number | undefined, asset: string): boolean {
+    const claimed = epoch ?? this.fencingEpoch;
+    if (claimed === this.fencingEpoch) return true;
+
+    contractSubmissionsTotal.inc({ path: 'fenced', status: 'stale_epoch' });
+    logger.warn('[Publisher] Rejected submission from stale fencing epoch', {
+      asset,
+      claimedEpoch: claimed,
+      currentEpoch: this.fencingEpoch,
+    });
+    return false;
   }
 
   /**
@@ -446,8 +509,9 @@ export class ContractPublisher {
     price: bigint,
     decimals: number,
     timestamp: number,
+    epoch?: number,
   ): Promise<string | null> {
-    return this.submitPriceTo(this.contractId, asset, price, decimals, timestamp);
+    return this.submitPriceTo(this.contractId, asset, price, decimals, timestamp, false, epoch);
   }
 
   /** Send one submission to a specific contract id with bad-sequence recovery */
@@ -458,10 +522,15 @@ export class ContractPublisher {
     decimals: number,
     timestamp: number,
     isRetry = false,
+    epoch?: number,
   ): Promise<string | null> {
+    if (!this.admitEpoch(epoch, asset)) {
+      return null;
+    }
+
     const startMs = Date.now();
     const fnName = 'submit_price';
-    const params = { asset, price: price.toString(), decimals, timestamp };
+    const params = { asset, price: price.toString(), decimals, timestamp, epoch: this.fencingEpoch };
 
     let txHash = '';
     try {
@@ -482,6 +551,7 @@ export class ContractPublisher {
               nativeToScVal(price, { type: 'i128' }),
               nativeToScVal(decimals, { type: 'u32' }),
               nativeToScVal(timestamp, { type: 'u64' }),
+              nativeToScVal(this.fencingEpoch, { type: 'u32' }),
             ],
           }),
         )
@@ -558,7 +628,7 @@ export class ContractPublisher {
         if (!isRetry) {
           logger.warn(`[Contract] tx_bad_seq reported from sendTransaction for ${asset}. Resyncing account and retrying once...`);
           await this.getAccount(true);
-          return this.submitPriceTo(targetContractId, asset, price, decimals, timestamp, true);
+          return this.submitPriceTo(targetContractId, asset, price, decimals, timestamp, true, epoch);
         }
       }
 
@@ -647,7 +717,7 @@ export class ContractPublisher {
           { txHash, contractErrorName },
         );
       } else {
-        this.retryQueue.enqueue({ asset, price, decimals, timestamp });
+        this.retryQueue.enqueue({ asset, price, decimals, timestamp, epoch: this.fencingEpoch });
       }
 
       return null;
@@ -656,7 +726,7 @@ export class ContractPublisher {
         logger.warn(`[Contract] tx_bad_seq exception for ${asset}. Resyncing sequence and retrying once...`);
         try {
           await this.getAccount(true);
-          return this.submitPriceTo(targetContractId, asset, price, decimals, timestamp, true);
+          return this.submitPriceTo(targetContractId, asset, price, decimals, timestamp, true, epoch);
         } catch (resyncErr) {
           logger.error(`[Contract] Failed to resync account after tx_bad_seq: ${resyncErr}`);
         }
@@ -694,6 +764,7 @@ export class ContractPublisher {
           price,
           decimals,
           timestamp,
+          epoch: this.fencingEpoch,
         });
       }
 
@@ -1072,10 +1143,26 @@ export class ContractPublisher {
       logger.debug('[Publisher] Skipping contract write: publication is suspended');
       return;
     }
+    // Issue #742 — a fenced publisher must not start new writes; the
+    // orchestrator drains and validates before unfencing.
+    if (this.fenced) {
+      logger.warn('[Publisher] Skipping publish round: publisher is fenced', {
+        reason: this.fenceReason,
+        assets: prices.length,
+      });
+      return;
+    }
     this.resetRoundRpcMetrics();
 
-    // Re-read the on-chain canary registration once per publish round
-    await this.refreshCanary();
+    // Issue #741 — critical price publication is always allowed, but the
+    // optional canary refresh is non-critical and is skipped under minimal
+    // brownout to shed RPC load while preserving price freshness.
+    if (this.brownout.isAllowed('canary_refresh')) {
+      // Re-read the on-chain canary registration once per publish round
+      await this.refreshCanary();
+    } else {
+      logger.debug('[Publisher] Brownout: skipping canary refresh (non-critical)');
+    }
 
     // Issue #726 — refresh the consistent read snapshot for each asset before
     // publishing so evidence carries the policy version observed this round.
@@ -1090,9 +1177,15 @@ export class ContractPublisher {
     // transactions (one per asset, but far cheaper than full submit_price)
     // apply the individual prices.  Falls back to per-asset submit_price when
     // batch construction or the commit transaction fails.
-    const batchSucceeded = await this.publishViaBatch(prices);
-    if (batchSucceeded) {
-      return;
+    // Issue #741 — under minimal brownout the batch path is shed entirely and
+    // the cheaper per-asset path is used to reduce transaction count.
+    if (this.brownout.isAllowed('batch_publication')) {
+      const batchSucceeded = await this.publishViaBatch(prices);
+      if (batchSucceeded) {
+        return;
+      }
+    } else {
+      logger.warn('[Publisher] Brownout: batch path shed, using per-asset submission');
     }
 
     // Fallback: per-asset submit_price (original behaviour).
@@ -1378,9 +1471,22 @@ export class ContractPublisher {
 
   processRetryQueue(): void {
     if (!this.publishingEnabled) return;
+    // Issue #742 — never flush the retry queue while fenced.
+    if (this.fenced) {
+      logger.debug('[Publisher] Skipping retry processing: publisher is fenced', {
+        reason: this.fenceReason,
+      });
+      return;
+    }
+    // Issue #741 — retry processing is non-critical work; under minimal
+    // brownout it is deferred so RPC capacity is reserved for fresh prices.
+    if (!this.brownout.isAllowed('retry_processing')) {
+      logger.debug('[Publisher] Brownout: deferring retry queue processing');
+      return;
+    }
     const items = this.retryQueue.getQueueItems();
     for (const item of items) {
-      this.submitPrice(item.asset, item.price, item.decimals, item.timestamp)
+      this.submitPrice(item.asset, item.price, item.decimals, item.timestamp, item.epoch)
         .then((result) => {
           if (result) {
             this.retryQueue.remove(`${item.asset}:${item.timestamp}`);
@@ -1404,6 +1510,11 @@ export class ContractPublisher {
     return this.submissionSequence;
   }
 
+  /** Issue #745 — persisted fencing state, for health checks and dashboards. */
+  getFencingEpochState(): FencingEpochState {
+    return this.fencingEpochStore.load();
+  }
+
   getConsecutiveFailures(): number {
     return this.canaryRollbackGuard.consecutiveFailures();
   }
@@ -1421,8 +1532,23 @@ export class ContractPublisher {
       logger.info(`[Publisher] Draining ${items.length} item(s) from retry queue before exit...`);
       for (const item of items) {
         if (!this.publishingEnabled) break;
+        // Issue #742 — stop draining as soon as the publisher is fenced so a
+        // maintenance drain cannot race with a fresh fence.
+        if (this.fenced) {
+          logger.warn('[Publisher] Drain aborted: publisher was fenced mid-drain', {
+            reason: this.fenceReason,
+            remaining: items.length,
+          });
+          break;
+        }
         try {
-          const result = await this.submitPrice(item.asset, item.price, item.decimals, item.timestamp);
+          const result = await this.submitPrice(
+            item.asset,
+            item.price,
+            item.decimals,
+            item.timestamp,
+            item.epoch,
+          );
           if (result) {
             this.retryQueue.remove(`${item.asset}:${item.timestamp}`);
           }
