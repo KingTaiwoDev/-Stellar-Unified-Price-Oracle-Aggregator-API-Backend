@@ -12,6 +12,8 @@ import { HybridCache } from './cache';
 import { cacheHitTotal, cacheMissTotal, lastPriceTimestamp, priceQueriesTotal } from '../observability/metrics';
 import { links, withLinks } from './hypermedia';
 import { createLineageForPrice } from '../platform/lineage';
+import { buildPriceProvenance } from './consumer/price-provenance';
+import { latencyFreshnessMiddleware } from './consumer/latency-freshness';
 import { Router, Request, Response } from 'express';
 import { conditionalCache } from './conditional-cache';
 import { eventBus } from '../domain-events';
@@ -32,6 +34,7 @@ export function initializeCache(cache: HybridCache<unknown>): void {
 }
 
 router.use(['/prices', '/prices/:asset'], conditionalCache);
+router.use(['/prices', '/prices/:asset'], latencyFreshnessMiddleware());
 
 router.get('/', (_req: Request, res: Response) => {
   res.json({
@@ -183,6 +186,37 @@ router.get('/prices/:asset', async (req: Request, res: Response) => {
 
   await pricesCache.set(cacheKey, data, 'price');
   res.json(ok(data));
+});
+
+// GET /prices/:asset/provenance — price-provenance response (#718)
+// Links a price to its catalog version, aggregation policy, source set, and
+// observation-time semantics.
+router.get('/prices/:asset/provenance', async (req: Request, res: Response) => {
+  const asset = req.params.asset.toUpperCase();
+
+  const prices = await readAssetPrices();
+  const price = prices.find((p) => p.asset === asset);
+
+  if (!price) {
+    return res.status(404).json(
+      fail({ code: 'PRICE_NOT_FOUND', message: 'Price not found for the requested asset' }),
+    );
+  }
+
+  const provenance = buildPriceProvenance(
+    {
+      asset: price.asset,
+      price: price.price,
+      decimals: price.decimals,
+      sources: price.sources,
+      timestamp: price.timestamp,
+      observedAt: price.observedAt,
+      fetchedAt: price.fetchedAt,
+    },
+    '/api/v1',
+  );
+
+  res.json(ok(provenance));
 });
 
 // GET /history/:asset — cursor-paginated time-series
