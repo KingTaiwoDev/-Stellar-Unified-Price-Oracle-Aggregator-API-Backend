@@ -14,33 +14,24 @@ export interface CircuitBreakerMetrics {
   suspiciousSourcesList: Array<{ key: string; deviations: number }>;
 }
 
-// Issue #739 — per-feed replication lag and missing-sequence detection.
-export interface FeedLagStatus {
-  feed: string;
-  region: string;
-  /** Seconds since the most recent sequence was observed for this feed. */
-  lagSeconds: number;
-  /** Highest sequence number observed for this feed. */
-  latestSequence: number;
-  /** Sequences detected as missing (gaps) within the observation window. */
-  missingSequences: number[];
-  /** Whether lagSeconds exceeds the feed's configured threshold. */
-  stale: boolean;
-  /** Lag threshold (seconds) tied to consumer impact for this feed. */
-  thresholdSeconds: number;
+// #736 — a deployment cell bounds the blast radius of a single deployment or
+// dependency failure to a fixed set of feeds and consumers.
+export interface CellStatus {
+  id: string;
+  feeds: string[];
+  dependencies: Record<string, boolean>;
+  degraded: boolean;
+  reason?: string;
 }
 
-// Issue #740 — routing decision derived from per-feed health signals.
-export interface FeedRoutingState {
+// #737 — explicit per-feed ownership: primary/failover region and the epoch of
+// the single authorized publisher.
+export interface FeedOwnership {
   feed: string;
-  /** Region currently selected to serve this feed. */
-  activeRegion: string;
-  /** Regions eligible to serve this feed, in deterministic failover order. */
-  failoverOrder: string[];
-  /** True when routing fell back from the preferred region. */
-  failoverActive: boolean;
-  /** Reason for the current routing decision (e.g. 'healthy', 'stale', 'missing_sequences'). */
-  reason: string;
+  primaryRegion: string;
+  failoverRegion: string;
+  ownerRegion: string;
+  publisherEpoch: number;
 }
 
 export interface HealthSnapshot {
@@ -56,20 +47,28 @@ export interface HealthSnapshot {
   onChainHeartbeat?: Record<string, number>;
   // Issue #590 — resolved listen ports (PORT base, PORT+1 WS, PORT+2 HTTP).
   ports?: { base: number; ws: number; http: number };
-  // Issue #739 — per-feed replication lag / missing-sequence status.
-  feedLag?: FeedLagStatus[];
-  // Issue #740 — per-feed routing decisions derived from feed health.
-  feedRouting?: FeedRoutingState[];
-  // Issue #740 — true when shutdown is in progress (used by readiness).
-  shutdownInProgress?: boolean;
+  // Issue #741 — controlled brownout state (current tier + shed features).
+  brownout?: BrownoutSnapshot;
+  // Issue #742 — planned maintenance window state (draining / fenced / validating).
+  maintenance?: MaintenanceSnapshot;
 }
 
-/**
- * Issue #739/#740 — classify feed health into a routing/readiness signal.
- * A feed is degraded when it is stale or has missing sequences.
- */
-export function isFeedDegraded(status: FeedLagStatus): boolean {
-  return status.stale || status.missingSequences.length > 0;
+export interface BrownoutSnapshot {
+  active: boolean;
+  tier: string;
+  shedFeatures: string[];
+  reason?: string;
+  since?: number;
+}
+
+export interface MaintenanceSnapshot {
+  active: boolean;
+  phase: 'idle' | 'precheck' | 'draining' | 'fenced' | 'validating' | 'complete' | 'aborted';
+  region?: string;
+  startedAt?: number;
+  deadlineAt?: number;
+  publisherFenced: boolean;
+  validationPassed?: boolean;
 }
 
 export class HealthServer {
@@ -117,16 +116,10 @@ export class HealthServer {
         const hasPrices = snap.lastAggregated.length > 0;
         const quarantined = snap.region?.quarantined === true;
         const shuttingDown = snap.shutdownInProgress === true;
-        // Issue #739/#740 — feed-level degradation feeds into readiness.
-        const feedLag = snap.feedLag ?? [];
-        const degradedFeeds = feedLag.filter(isFeedDegraded);
-        const allFeedsDegraded = feedLag.length > 0 && degradedFeeds.length === feedLag.length;
-        const ready =
-          hasPrices &&
-          !quarantined &&
-          !shuttingDown &&
-          !allFeedsDegraded &&
-          openCircuits.length < Object.keys(snap.sourceHealth).length;
+        // #742 — a cell being drained/fenced for maintenance must not receive traffic.
+        const maintenanceActive = snap.maintenance?.active === true;
+        const ready = hasPrices && !quarantined && !shuttingDown && !maintenanceActive
+          && openCircuits.length < Object.keys(snap.sourceHealth).length;
         const code = ready ? 200 : 503;
         res.writeHead(code, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
@@ -136,48 +129,30 @@ export class HealthServer {
           shutdownInProgress: shuttingDown,
           startupTimeMs: snap.startupTimeMs ?? 0,
           openCircuitBreakers: openCircuits.length,
-          // Issue #739/#740 — feed-level readiness detail.
-          feeds: {
-            total: feedLag.length,
-            degraded: degradedFeeds.length,
-            allDegraded: allFeedsDegraded,
-            degradedFeeds: degradedFeeds.map((f) => f.feed),
-          },
+          // #741 — brownout is a partial-service mode; readiness stays true but is surfaced.
+          brownout: snap.brownout
+            ? { active: snap.brownout.active, tier: snap.brownout.tier, shedFeatures: snap.brownout.shedFeatures }
+            : { active: false, tier: 'none', shedFeatures: [] },
+          // #742 — maintenance progress for orchestrators.
+          maintenance: snap.maintenance
+            ? { active: snap.maintenance.active, phase: snap.maintenance.phase, publisherFenced: snap.maintenance.publisherFenced }
+            : { active: false, phase: 'idle', publisherFenced: false },
         }));
         return;
       }
 
-      // Issue #739/#740 — per-feed replication lag and routing state.
-      if (url.pathname === '/health/feeds') {
+      // #736 — cell boundaries, assigned feeds and dependency reachability.
+      if (url.pathname === '/health/cells') {
         const snap = this.getSnapshot();
-        const feedLag = snap.feedLag ?? [];
-        const feedRouting = snap.feedRouting ?? [];
-        const degraded = feedLag.filter(isFeedDegraded);
-        const status =
-          feedLag.length === 0
-            ? 'unknown'
-            : degraded.length === 0
-              ? 'healthy'
-              : degraded.length === feedLag.length
-                ? 'unhealthy'
-                : 'degraded';
-        const httpStatus = status === 'unhealthy' ? 503 : 200;
-        res.writeHead(httpStatus, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          status,
-          timestamp: Math.floor(Date.now() / 1000),
-          feeds: feedLag.map((f) => ({
-            feed: f.feed,
-            region: f.region,
-            lagSeconds: f.lagSeconds,
-            latestSequence: f.latestSequence,
-            missingSequences: f.missingSequences,
-            stale: f.stale,
-            thresholdSeconds: f.thresholdSeconds,
-            degraded: isFeedDegraded(f),
-          })),
-          routing: feedRouting,
+        const cells = (snap.cells ?? []).map((c) => ({
+          id: c.id,
+          feeds: c.feeds,
+          dependencies: c.dependencies,
+          degraded: c.degraded,
+          reason: c.reason,
         }));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ cells }));
         return;
       }
 
@@ -259,16 +234,10 @@ export class HealthServer {
           onChainHeartbeat: snap.onChainHeartbeat || {},
           // #590 — resolved listen ports, so drift is visible at runtime
           ...(snap.ports ? { ports: snap.ports } : {}),
-          // #739 — per-feed replication lag summary
-          feedLag: (snap.feedLag ?? []).map((f) => ({
-            feed: f.feed,
-            region: f.region,
-            lagSeconds: f.lagSeconds,
-            stale: f.stale,
-            missingSequences: f.missingSequences.length,
-          })),
-          // #740 — per-feed routing decisions
-          feedRouting: snap.feedRouting ?? [],
+          // #741 — controlled brownout state
+          brownout: snap.brownout || { active: false, tier: 'none', shedFeatures: [] },
+          // #742 — maintenance window state
+          maintenance: snap.maintenance || { active: false, phase: 'idle', publisherFenced: false },
         };
 
         if (verbose) {

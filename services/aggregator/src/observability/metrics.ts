@@ -321,83 +321,74 @@ export const historyFileWriteFailuresTotal = new client.Counter({
   registers: [register],
 });
 
-// Issue #739 — per-feed replication lag and missing sequence detection.
-// Lag is measured at feed granularity (feed = region + source stream) so a
-// single degraded feed cannot be hidden behind an aggregate region health
-// signal. Thresholds are tied to consumer impact: consumers reading a feed
-// older than the configured freshness budget are considered impacted.
-export const feedReplicationLagSeconds = new client.Histogram({
-  name: 'feed_replication_lag_seconds',
-  help: 'Replication lag in seconds between the producer sequence and the last applied sequence, per feed',
-  labelNames: ['feed', 'region'],
-  buckets: [0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600, 1800],
+// Issue #741 — controlled brownout mode.
+// The current brownout tier (0 = full service, higher = more shedding) so
+// operators can see at a glance which partial-service mode is active.
+export const brownoutTier = new client.Gauge({
+  name: 'brownout_tier',
+  help: 'Current brownout tier (0 = full service, 1 = light, 2 = heavy shedding)',
   registers: [register],
 });
 
-export const feedReplicationLagGauge = new client.Gauge({
-  name: 'feed_replication_lag_seconds_current',
-  help: 'Most recently observed replication lag in seconds for a feed',
-  labelNames: ['feed', 'region'],
+export const brownoutTierTransitionsTotal = new client.Counter({
+  name: 'brownout_tier_transitions_total',
+  help: 'Number of brownout tier transitions by from/to tier and trigger',
+  labelNames: ['from_tier', 'to_tier', 'trigger'],
   registers: [register],
 });
 
-export const feedMissingSequencesTotal = new client.Counter({
-  name: 'feed_missing_sequences_total',
-  help: 'Total number of sequence gaps detected per feed (sum of missing sequence counts)',
-  labelNames: ['feed', 'region'],
+// Non-critical work skipped while a brownout tier is active. Price freshness
+// and publication are never shed, so these counters must be the only work
+// dropped during a brownout.
+export const brownoutShedOperationsTotal = new client.Counter({
+  name: 'brownout_shed_operations_total',
+  help: 'Non-critical operations skipped because of brownout shedding, by feature and tier',
+  labelNames: ['feature', 'tier'],
   registers: [register],
 });
 
-export const feedSequenceGapEventsTotal = new client.Counter({
-  name: 'feed_sequence_gap_events_total',
-  help: 'Total number of distinct sequence gap events detected per feed',
-  labelNames: ['feed', 'region'],
+export const brownoutActiveDurationSeconds = new client.Gauge({
+  name: 'brownout_active_duration_seconds',
+  help: 'Seconds the current brownout tier has been continuously active (0 when full service)',
   registers: [register],
 });
 
-export const feedLagThresholdBreachesTotal = new client.Counter({
-  name: 'feed_lag_threshold_breaches_total',
-  help: 'Total number of times a feed exceeded its consumer-impact lag threshold',
-  labelNames: ['feed', 'region', 'severity'],
+// Issue #742 — regional maintenance windows.
+// Phase durations let operators verify prechecks, drain, fencing and
+// validation each complete within their budget.
+export const maintenanceWindowPhaseDurationMs = new client.Histogram({
+  name: 'maintenance_window_phase_duration_ms',
+  help: 'Duration of each maintenance window phase in milliseconds',
+  labelNames: ['region', 'phase', 'status'],
+  buckets: [100, 500, 1000, 5000, 10000, 30000, 60000, 120000, 300000, 600000],
   registers: [register],
 });
 
-export const feedIntegrityOk = new client.Gauge({
-  name: 'feed_integrity_ok',
-  help: 'Whether the feed currently has no detected sequence gaps (1) or has gaps (0)',
-  labelNames: ['feed', 'region'],
+export const maintenanceWindowPrechecksTotal = new client.Counter({
+  name: 'maintenance_window_prechecks_total',
+  help: 'Maintenance window precheck results by region, check name and outcome (pass|fail)',
+  labelNames: ['region', 'check', 'outcome'],
   registers: [register],
 });
 
-// Issue #740 — feed-health based consumer routing.
-// Routing decisions are made per feed using freshness and integrity signals
-// rather than region health alone, so failover is deterministic and auditable.
-export const feedRoutingDecisionsTotal = new client.Counter({
-  name: 'feed_routing_decisions_total',
-  help: 'Total consumer routing decisions by feed, outcome (primary|failover|reject) and reason',
-  labelNames: ['feed', 'region', 'outcome', 'reason'],
+export const maintenanceWindowPostchecksTotal = new client.Counter({
+  name: 'maintenance_window_postchecks_total',
+  help: 'Maintenance window post-maintenance validation results by region, check name and outcome (pass|fail)',
+  labelNames: ['region', 'check', 'outcome'],
   registers: [register],
 });
 
-export const feedRoutingFailoversTotal = new client.Counter({
-  name: 'feed_routing_failovers_total',
-  help: 'Total times consumers were failed over from a primary feed to a fallback feed',
-  labelNames: ['feed', 'fallback_feed', 'reason'],
+export const maintenanceWindowAbortsTotal = new client.Counter({
+  name: 'maintenance_window_aborts_total',
+  help: 'Maintenance windows aborted before completion, by region and reason',
+  labelNames: ['region', 'reason'],
   registers: [register],
 });
 
-export const feedHealthScore = new client.Gauge({
-  name: 'feed_health_score',
-  help: 'Composite feed health score in [0,1] derived from freshness and integrity signals',
-  labelNames: ['feed', 'region'],
-  registers: [register],
-});
-
-export const feedRoutingEvaluationDurationMs = new client.Histogram({
-  name: 'feed_routing_evaluation_duration_ms',
-  help: 'Time taken to evaluate feed health and select a route for a consumer request, in milliseconds',
-  labelNames: ['feed'],
-  buckets: [0.1, 0.5, 1, 2, 5, 10, 25, 50, 100, 250],
+export const maintenanceWindowActive = new client.Gauge({
+  name: 'maintenance_window_active',
+  help: 'Whether a maintenance window is currently active for a region (1) or not (0)',
+  labelNames: ['region'],
   registers: [register],
 });
 

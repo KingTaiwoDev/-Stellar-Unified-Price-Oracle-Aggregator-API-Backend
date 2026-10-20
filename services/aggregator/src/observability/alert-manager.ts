@@ -22,9 +22,7 @@ export interface AlertEvent {
     | 'sla_breach'
     | 'invalid_payload'
     | 'region_quarantine'
-    | 'feed_replication_lag'
-    | 'feed_missing_sequences'
-    | 'feed_health_failover';
+    | 'surge_limit';
   message: string;
   previousPrice?: string;
   currentPrice?: string;
@@ -38,20 +36,14 @@ export interface AlertEvent {
   regionCount?: number;
   peerCount?: number;
   driftKnown?: boolean;
-  /** Issue #739/#740: feed identifier the alert is scoped to */
-  feedId?: string;
-  /** Issue #739: number of missing sequence numbers observed */
-  missingSequences?: number;
-  /** Issue #739: last sequence number successfully consumed */
-  lastSeenSequence?: number;
-  /** Issue #739: next sequence number expected by the consumer */
-  expectedSequence?: number;
-  /** Issue #740: why consumer routing moved off a feed */
-  failoverReason?: 'lag' | 'missing_sequences' | 'integrity' | 'unavailable';
-  /** Issue #740: region routing failed over from */
-  fromRegion?: string;
-  /** Issue #740: region routing failed over to */
-  toRegion?: string;
+  /** Issue #744: surge-limit scope, e.g. "failover" or "recovery" */
+  surgeScope?: string;
+  /** Issue #744: which limit was hit, e.g. "budget" or "provider_quota" */
+  surgeLimitKind?: 'budget' | 'provider_quota' | 'request_rate';
+  /** Issue #744: percent of the limit consumed (0-100+) */
+  surgeUtilizationPercent?: number;
+  /** Issue #744: degradation action taken or recommended */
+  surgeAction?: 'none' | 'throttle' | 'shed_load' | 'pause_failover';
 }
 
 export interface AlertConfig {
@@ -88,15 +80,10 @@ export interface AlertConfig {
   invalidPayloadMaxPerWindow?: number;
   /** Issue #584: rolling window in seconds for invalid-payload rate alerting */
   invalidPayloadWindowSeconds?: number;
-  /**
-   * Issue #739: per-feed replication lag (seconds) above which a consumer-impact
-   * alert fires. Tied to consumer staleness tolerance, not raw replication speed.
-   */
-  feedReplicationLagThresholdSeconds?: number;
-  /** Issue #739: number of missing sequences in the window before alerting */
-  feedMissingSequenceMaxPerWindow?: number;
-  /** Issue #739: rolling window in seconds for missing-sequence rate alerting */
-  feedMissingSequenceWindowSeconds?: number;
+  /** Issue #744: utilization percent at which a surge warning fires */
+  surgeWarningPercent?: number;
+  /** Issue #744: utilization percent at which a surge critical alert fires */
+  surgeCriticalPercent?: number;
 }
 
 class AlertManager {
@@ -124,9 +111,8 @@ class AlertManager {
     flapMaxTriggers: 3,
     invalidPayloadMaxPerWindow: 5,
     invalidPayloadWindowSeconds: 900,
-    feedReplicationLagThresholdSeconds: 30,
-    feedMissingSequenceMaxPerWindow: 3,
-    feedMissingSequenceWindowSeconds: 300,
+    surgeWarningPercent: 80,
+    surgeCriticalPercent: 95,
   };
 
   constructor(config: Partial<AlertConfig> = {}) {
@@ -368,119 +354,49 @@ class AlertManager {
   }
 
   /**
-   * Issue #739 — per-feed replication lag.
+   * Issue #744 — surge-limit alerting for failover and recovery.
    *
-   * Measures how far a consumer's view of a feed trails the producer, at feed
-   * granularity (not region granularity). The threshold is expressed in
-   * seconds of consumer-visible staleness: once a consumer would be serving
-   * data older than `feedReplicationLagThresholdSeconds`, the lag is treated
-   * as consumer-impacting and alerts. Returns whether the alert fired.
-   *
-   * Runbook: docs/runbooks/feed-replication-lag.md
+   * Called by the surge limiter before a budget or provider quota is
+   * exhausted so operators get a warning while there is still headroom to
+   * degrade safely. Emits a warning at `surgeWarningPercent` and a critical
+   * alert at `surgeCriticalPercent`; below the warning threshold nothing is
+   * emitted. Returns whether an alert fired, for the caller's metrics.
    */
-  async checkFeedReplicationLag(
-    feedId: string,
-    region: string,
-    lagSeconds: number,
-  ): Promise<boolean> {
-    const thresholdSeconds = this.config.feedReplicationLagThresholdSeconds ?? 30;
-    if (!Number.isFinite(lagSeconds) || lagSeconds <= thresholdSeconds) {
-      return false;
-    }
-
-    return this.emitAlert({
-      timestamp: Math.floor(Date.now() / 1000),
-      asset: feedId.toUpperCase(),
-      type: 'feed_replication_lag',
-      region,
-      feedId,
-      elapsedSeconds: lagSeconds,
-      thresholdSeconds,
-      message: `Feed ${feedId} replication lag ${lagSeconds}s in region ${region} exceeds consumer-impact threshold ${thresholdSeconds}s. Runbook: docs/runbooks/feed-replication-lag.md`,
-    });
-  }
-
-  /**
-   * Issue #739 — missing sequence detection.
-   *
-   * A gap in a feed's sequence numbers means a consumer has silently skipped
-   * updates, which is an integrity failure rather than a latency one. A single
-   * gap is recorded; a sustained rate pages. Returns whether the alert fired.
-   *
-   * Runbook: docs/runbooks/feed-missing-sequences.md
-   */
-  async checkFeedMissingSequences(
-    feedId: string,
-    region: string,
-    missingCount: number,
-    lastSeenSequence: number,
-    expectedSequence: number,
-  ): Promise<boolean> {
-    if (!Number.isFinite(missingCount) || missingCount <= 0) {
-      return false;
-    }
-
-    const now = Math.floor(Date.now() / 1000);
-    const key = `${feedId}:${region}`;
-    const windowSeconds = this.config.feedMissingSequenceWindowSeconds ?? 300;
-    const timestamps = this.feedMissingSequenceTimestamps.get(key) || [];
-    const windowStart = now - windowSeconds;
-    const recent = timestamps.filter((t) => t >= windowStart);
-    recent.push(now);
-    this.feedMissingSequenceTimestamps.set(key, recent);
-
-    const maxPerWindow = this.config.feedMissingSequenceMaxPerWindow ?? 3;
-    if (recent.length < maxPerWindow) {
-      return false;
-    }
-
-    const fired = await this.emitAlert({
-      timestamp: now,
-      asset: feedId.toUpperCase(),
-      type: 'feed_missing_sequences',
-      region,
-      feedId,
-      missingSequences: missingCount,
-      lastSeenSequence,
-      expectedSequence,
-      message: `Feed ${feedId} in region ${region} missing sequences: expected ${expectedSequence}, last seen ${lastSeenSequence} (${missingCount} missing). ${recent.length} gap events in ${windowSeconds}s (max: ${maxPerWindow}). Runbook: docs/runbooks/feed-missing-sequences.md`,
-    });
-
-    // Reset the window after firing so a constant gap rate does not hot-loop.
-    this.feedMissingSequenceTimestamps.set(key, []);
-    return fired;
-  }
-
-  /**
-   * Issue #740 — feed-health failover event.
-   *
-   * Fires whenever consumer routing moves off a feed because of a per-feed
-   * freshness or integrity signal, so failover is observable and auditable
-   * rather than silent. Deterministic: the same signal produces the same
-   * alert key, so dedup/flap suppression apply per feed and reason.
-   *
-   * Runbook: docs/runbooks/feed-health-failover.md
-   */
-  async reportFeedHealthFailover(event: {
-    feedId: string;
-    fromRegion: string;
-    toRegion: string;
-    reason: 'lag' | 'missing_sequences' | 'integrity' | 'unavailable';
-    lagSeconds?: number;
-    missingSequences?: number;
+  async checkSurgeLimit(event: {
+    scope: string;
+    limitKind: 'budget' | 'provider_quota' | 'request_rate';
+    utilizationPercent: number;
+    action?: 'none' | 'throttle' | 'shed_load' | 'pause_failover';
+    asset?: string;
+    source?: string;
+    region?: string;
   }): Promise<boolean> {
+    const warningPercent = this.config.surgeWarningPercent ?? 80;
+    const criticalPercent = this.config.surgeCriticalPercent ?? 95;
+    const utilization = event.utilizationPercent;
+
+    if (!Number.isFinite(utilization) || utilization < warningPercent) {
+      return false;
+    }
+
+    const critical = utilization >= criticalPercent;
+    const action = event.action ?? 'none';
+    const asset = (event.asset ?? 'GLOBAL').toUpperCase();
+
     return this.emitAlert({
       timestamp: Math.floor(Date.now() / 1000),
-      asset: event.feedId.toUpperCase(),
-      type: 'feed_health_failover',
-      region: event.fromRegion,
-      feedId: event.feedId,
-      failoverReason: event.reason,
-      fromRegion: event.fromRegion,
-      toRegion: event.toRegion,
-      elapsedSeconds: event.lagSeconds,
-      missingSequences: event.missingSequences,
-      message: `Consumer routing failed over for feed ${event.feedId}: ${event.fromRegion} -> ${event.toRegion} (reason=${event.reason}${event.lagSeconds !== undefined ? `, lag=${event.lagSeconds}s` : ''}${event.missingSequences !== undefined ? `, missing=${event.missingSequences}` : ''}). Runbook: docs/runbooks/feed-health-failover.md`,
+      asset,
+      type: 'surge_limit',
+      source: event.source,
+      region: event.region,
+      surgeScope: event.scope,
+      surgeLimitKind: event.limitKind,
+      surgeUtilizationPercent: utilization,
+      surgeAction: action,
+      message:
+        `${critical ? 'CRITICAL' : 'WARNING'} surge limit for ${event.scope} (${event.limitKind}): ` +
+        `${utilization.toFixed(1)}% utilized (warn ${warningPercent}%, critical ${criticalPercent}%). ` +
+        `action=${action}. Runbook: docs/runbooks/surge-limits.md`,
     });
   }
 
@@ -555,9 +471,11 @@ class AlertManager {
   private getAlertKey(alert: AlertEvent): string {
     const target = alert.source ?? alert.affectedSources?.join(',') ?? 'global';
     const base = `${alert.asset.toUpperCase()}:${alert.type}:${target}`;
-    const withFeed = alert.feedId ? `${base}:${alert.feedId}:${alert.region ?? 'global'}` : base;
-    const withReason = alert.failoverReason ? `${withFeed}:${alert.failoverReason}` : withFeed;
-    return alert.transition ? `${withReason}:${alert.transition}` : withReason;
+    const withTransition = alert.transition ? `${base}:${alert.transition}` : base;
+    if (alert.type === 'surge_limit') {
+      return `${withTransition}:${alert.surgeScope ?? 'global'}:${alert.surgeLimitKind ?? 'unknown'}`;
+    }
+    return withTransition;
   }
 
   private isFlapping(alertKey: string, now: number): boolean {
@@ -609,7 +527,7 @@ class AlertManager {
           payload: {
             summary: alert.message,
             source: 'price-oracle-aggregator',
-            severity: (alert.type === 'source_down' || alert.type === 'sla_breach' || alert.type === 'region_quarantine' || alert.type === 'feed_missing_sequences') ? 'critical' : 'warning',
+            severity: (alert.type === 'source_down' || alert.type === 'sla_breach' || alert.type === 'region_quarantine' || (alert.type === 'surge_limit' && (alert.surgeUtilizationPercent ?? 0) >= (this.config.surgeCriticalPercent ?? 95))) ? 'critical' : 'warning',
             custom_details: alert,
           },
         }),
@@ -624,7 +542,7 @@ class AlertManager {
 
   private async sendOpsgenie(alert: AlertEvent): Promise<void> {
     try {
-      const priority = alert.type === 'source_down' || alert.type === 'sla_breach' || alert.type === 'region_quarantine' || alert.type === 'feed_missing_sequences' ? 'P1' : 'P3';
+      const priority = alert.type === 'source_down' || alert.type === 'sla_breach' || alert.type === 'region_quarantine' || (alert.type === 'surge_limit' && (alert.surgeUtilizationPercent ?? 0) >= (this.config.surgeCriticalPercent ?? 95)) ? 'P1' : 'P3';
       const response = await fetch('https://api.opsgenie.com/v2/alerts', {
         method: 'POST',
         headers: {

@@ -59,142 +59,213 @@ The weekly resilience CronJob additionally verifies `environment=staging` on the
 
 ---
 
-## Feature rollout and rollback guidance
+## Exiting brownout mode (#741)
 
-The sections below cover the resilience and security-assurance changes exercised by
-the chaos suite. Each feature is gated by a flag or config value so it can be
-rolled out incrementally and reverted without a redeploy of unrelated components.
-All flags default to their pre-change behaviour so that a rollback is always a
-single config flip.
+Brownout mode sheds non-critical work while preserving explicit price freshness and
+publication guarantees. It is controlled by the `BROWNOUT_MODE` flag and the
+`BROWNOUT_SHED` allow-list. Owner: Global Operations and Resilience.
 
-### Feed-level replication lag thresholds (#739)
+### When to exit
 
-**Owner:** Global operations and resilience.
+Exit brownout when the triggering condition has cleared and the following hold for
+at least one full freshness window:
 
-**Rollout**
+- `oracle_price_freshness_seconds` is within SLO for every published pair.
+- `oracle_publication_lag_seconds` p99 is back under its threshold.
+- Error budget burn rate is below the page threshold.
 
-1. Deploy with `FEED_LAG_THRESHOLDS_ENABLED=false` (default). Lag is still
-   measured and exported as metrics, but no threshold alerts fire.
-2. Enable in staging: `FEED_LAG_THRESHOLDS_ENABLED=true`. Observe
-   `feed_replication_lag_seconds{feed,region}` and
-   `feed_missing_sequence_total{feed,region}` for at least one full replication
-   cycle. Confirm thresholds are tied to consumer impact (consumer-visible
-   staleness budget), not raw feed cadence.
-3. Enable per feed in production by adding the feed to
-   `FEED_LAG_THRESHOLD_FEEDS` (comma-separated allowlist). Feeds not listed keep
-   the pre-change behaviour.
-4. Validate missing-sequence detection against a known gap in staging before
-   enabling it in production (`FEED_MISSING_SEQUENCE_ALERT=true`).
+### Rollback steps
 
-**Rollback**
+1. Re-enable shed work incrementally (never all at once):
 
-- Disable alerting only: set `FEED_LAG_THRESHOLDS_ENABLED=false`. Metrics remain
-  available for post-incident analysis.
-- Disable for a single feed: remove it from `FEED_LAG_THRESHOLD_FEEDS`.
-- Full revert: redeploy the previous overlay; no schema or data migration is
-  involved, so rollback is immediate and lossless.
+   ```bash
+   # Step 1: restore non-critical background jobs
+   kubectl -n stellar-oracle set env deploy/aggregator BROWNOUT_SHED="exports,analytics"
+   # Step 2: restore remaining shed work
+   kubectl -n stellar-oracle set env deploy/aggregator BROWNOUT_SHED=""
+   # Step 3: disable brownout mode entirely
+   kubectl -n stellar-oracle set env deploy/aggregator BROWNOUT_MODE="off"
+   ```
 
-**Monitoring:** watch `feed_replication_lag_seconds` p50/p95/p99 per feed and
-region, `feed_missing_sequence_total`, and alert-fire rate. A spike in
-missing-sequence alerts immediately after enablement usually indicates a
-threshold set below the feed's normal gap tolerance.
+2. If freshness or publication regresses after any step, immediately re-enter
+   brownout by reversing the last step:
 
-### Feed-health routing (#740)
+   ```bash
+   kubectl -n stellar-oracle set env deploy/aggregator BROWNOUT_MODE="on"
+   ```
 
-**Owner:** Global operations and resilience.
-
-**Rollout**
-
-1. Deploy with `FEED_HEALTH_ROUTING_ENABLED=false` (default). Routing continues
-   to use region health only.
-2. Enable in staging: `FEED_HEALTH_ROUTING_ENABLED=true`. Verify deterministic
-   failover by injecting feed staleness/integrity faults via the chaos suite and
-   confirming consumers move to a healthy feed in a bounded, repeatable order.
-3. Enable in production behind a canary consumer group first
-   (`FEED_HEALTH_ROUTING_CANARY=true`), then widen to all consumers.
-
-**Rollback**
-
-- Set `FEED_HEALTH_ROUTING_ENABLED=false` to return to region-only routing. This
-  is the primary kill switch and takes effect on the next routing decision.
-- If a specific feed is misclassified, pin it healthy via
-  `FEED_HEALTH_ROUTING_OVERRIDES` while investigating.
-- Full revert: redeploy the previous overlay. Routing state is derived, not
-  persisted, so no cleanup is required.
-
-**Monitoring:** track routing decisions per feed
-(`feed_routing_decisions_total{feed,reason}`), failover latency, and consumer
-error rate. A rise in failover events without a corresponding feed-health
-degradation indicates a misconfigured freshness or integrity signal.
-
-### Egress destination policy enforcement (#750)
-
-**Owner:** Security and privacy assurance.
-
-**Rollout**
-
-1. Deploy in **audit-only** mode: `EGRESS_POLICY_ENFORCE=false`. All outbound
-   destinations (provider and integration egress) are evaluated and logged via
-   `egress_policy_decisions_total{destination,decision}` but not blocked.
-2. Review audit logs in staging and confirm every legitimate destination is
-   allowlisted, including redirect targets and resolved DNS addresses.
-3. Enable enforcement in staging: `EGRESS_POLICY_ENFORCE=true`. Re-run the chaos
-   DNS and network experiments to prove redirects and DNS changes cannot bypass
-   controls (redirects are re-evaluated against policy; resolved addresses are
-   checked, not just hostnames).
-4. Enable enforcement in production after the audit window shows zero unexpected
-   denials.
-
-**Rollback**
-
-- Revert to audit-only: set `EGRESS_POLICY_ENFORCE=false`. Traffic is no longer
-  blocked; decisions continue to be logged.
-- If a single destination is wrongly denied, add it to
-  `EGRESS_POLICY_ALLOWLIST` rather than disabling enforcement globally.
-- Full revert: redeploy the previous overlay. No persistent state is created.
-
-**Monitoring:** alert on `egress_policy_decisions_total{decision="deny"}` rising
-above baseline and on any policy-evaluation error. Denials for previously
-allowed destinations are the primary signal of an over-tight policy.
-
-### Cryptographic key inventory and lifecycle (#751)
-
-**Owner:** Security and privacy assurance.
-
-**Rollout**
-
-1. Deploy the inventory in read-only mode: `KEY_INVENTORY_ENFORCE=false`. The
-   inventory records signing, encryption, and verification keys with owner,
-   rotation, retirement, and algorithm-transition metadata, but does not gate
-   operations.
-2. Populate owner mappings and lifecycle dates for every key in staging; confirm
-   the inventory reports no unowned or overdue keys.
-3. Enable enforcement in staging: `KEY_INVENTORY_ENFORCE=true`. Verify that keys
-   past their rotation or retirement deadline raise alerts and that algorithm
-   transitions follow the documented procedure.
-4. Enable in production once the inventory is complete and owner-mapped.
-
-**Rollback**
-
-- Set `KEY_INVENTORY_ENFORCE=false` to stop gating operations while keeping the
-  inventory populated and observable.
-- Key material itself is never modified by enabling or disabling the inventory;
-  rotation remains a separate, explicitly triggered operation.
-- Full revert: redeploy the previous overlay. The inventory is advisory metadata
-  and does not require data migration to roll back.
-
-**Monitoring:** track `key_inventory_keys_total{type,state}`,
-`key_rotation_overdue_total`, and `key_algorithm_transition_pending_total`.
-Unowned keys or overdue rotations are the primary signals requiring owner
-follow-up.
-
-### Cross-cutting verification after any rollback
+### Verification
 
 ```bash
-kubectl -n stellar-oracle get pods -l 'app in (api,aggregator)'
-curl -sf http://localhost:3000/api/v1/health
+# Confirm flag state
+kubectl -n stellar-oracle get deploy/aggregator -o jsonpath='{.spec.template.spec.containers[0].env}'
+# Confirm freshness and publication metrics recovered
+curl -sf http://localhost:3000/api/v1/health | jq '.brownout'
+curl -sf http://localhost:9090/api/v1/query \
+  --data-urlencode 'query=oracle_price_freshness_seconds' | jq '.data.result'
 ```
 
-Confirm the relevant feature flag has reverted to its default, that no
-unexpected `deny` or alert traffic remains, and record the rollback in
-[incident-review.md](incident-review.md).
+### Rollout / rollback guidance
+
+- Roll out brownout flags via the deployment overlay, not ad-hoc `kubectl set env`,
+  in production. The commands above are the emergency path.
+- Monitor `brownout_active`, `oracle_price_freshness_seconds`, and
+  `oracle_publication_lag_seconds` dashboards during both entry and exit.
+- Rollback of a brownout exit is always "re-enter brownout" — it is safe and
+  idempotent.
+
+---
+
+## Aborting a regional maintenance window (#742)
+
+Maintenance windows run a guarded workflow: prechecks → traffic drain → publisher
+fencing → maintenance → post-validation. Owner: Global Operations and Resilience.
+
+### Abort at any phase
+
+The maintenance controller exposes an abort endpoint that reverses the current
+phase safely. Abort is idempotent and safe to call from any phase.
+
+```bash
+# Abort the named window for a region
+curl -sf -X POST http://localhost:3000/api/v1/maintenance/abort \
+  -H 'content-type: application/json' \
+  -d '{"region":"us-east-1","reason":"operator abort"}'
+```
+
+If the controller is unreachable, abort manually in reverse phase order:
+
+1. **Unfence publishers** (if fenced):
+
+   ```bash
+   kubectl -n stellar-oracle label deploy/publisher \
+     maintenance-fenced- --overwrite
+   ```
+
+2. **Restore traffic** (if drained):
+
+   ```bash
+   kubectl -n stellar-oracle patch service aggregator --type merge \
+     -p '{"spec":{"selector":{"app":"aggregator"}}}'
+   ```
+
+3. **Clear the window record** so the scheduler does not resume a half-run window:
+
+   ```bash
+   kubectl -n stellar-oracle delete configmap maintenance-window-us-east-1 --ignore-not-found
+   ```
+
+### Verification
+
+```bash
+# Window state should be "aborted" or absent
+curl -sf http://localhost:3000/api/v1/maintenance/status?region=us-east-1 | jq
+# Publishers unfenced and serving
+kubectl -n stellar-oracle get deploy/publisher -o jsonpath='{.metadata.labels}'
+# Traffic restored
+kubectl -n stellar-oracle get endpoints aggregator
+# Freshness/publication intact
+curl -sf http://localhost:3000/api/v1/health | jq '.maintenance, .freshness'
+```
+
+### Rollout / rollback guidance
+
+- Enable maintenance automation per-region behind the `MAINTENANCE_AUTOMATION`
+  flag; start with a single canary region.
+- Monitor `maintenance_phase`, `maintenance_aborts_total`, and publisher fencing
+  state during rollout.
+- Rollback of the automation itself: set `MAINTENANCE_AUTOMATION=off`; any
+  in-flight window must be aborted first using the steps above.
+
+---
+
+## Tenant-isolation failure response (#747)
+
+Adversarial tenant-isolation tests run in CI across caches, REST, GraphQL,
+WebSockets, exports, and background jobs. A failure means a tenant boundary may be
+crossable. Owner: Security and Privacy Assurance.
+
+### Immediate response
+
+1. **Treat as a potential data-exposure incident.** Page the on-call security
+   engineer and open an incident.
+2. **Contain** by disabling the affected shared path if it can be isolated:
+
+   ```bash
+   # Example: disable cross-tenant export path
+   kubectl -n stellar-oracle set env deploy/api TENANT_EXPORTS_ENABLED="false"
+   ```
+
+3. **Preserve evidence** — capture the failing test seed and request trace:
+
+   ```bash
+   pnpm test:fuzz:tenant -- --seed "$FAILING_SEED" --repro > tenant-repro.log
+   ```
+
+### Rollback steps
+
+- If the regression was introduced by a recent deploy, roll back to the last
+  known-good image:
+
+  ```bash
+  kubectl -n stellar-oracle rollout undo deploy/api
+  kubectl -n stellar-oracle rollout status deploy/api
+  ```
+
+- Re-enable any contained path only after the fix is verified by the fuzz suite.
+
+### Verification
+
+```bash
+# Full tenant-isolation fuzz suite must pass
+pnpm test:fuzz:tenant
+# Confirm no cross-tenant cache keys leaked
+curl -sf http://localhost:3000/api/v1/health | jq '.tenant_isolation'
+```
+
+---
+
+## Authorization regression failure response (#749)
+
+The authorization regression corpus is a versioned matrix of allowed/denied
+actions across roles, scopes, lifecycle states, and API versions, run in CI. A
+failure means an action's allow/deny outcome changed unexpectedly. Owner: Security
+and Privacy Assurance.
+
+### Immediate response
+
+1. **Do not merge** the change that broke the corpus. The CI gate blocks it.
+2. Determine whether the change is an **intended** policy change or a **regression**:
+   - Intended: update the corpus matrix in the same PR with reviewer sign-off.
+   - Regression: revert the offending change.
+
+### Rollback steps
+
+```bash
+# Revert the offending commit (or roll back the deploy)
+git revert <offending-sha>
+# If already deployed:
+kubectl -n stellar-oracle rollout undo deploy/api
+kubectl -n stellar-oracle rollout status deploy/api
+```
+
+### Verification
+
+```bash
+# Corpus must pass against the running build
+pnpm test:authz:corpus
+# Spot-check a denied action is still denied
+curl -sf -o /dev/null -w '%{http_code}\n' \
+  -H 'authorization: Bearer <low-scope-token>' \
+  http://localhost:3000/api/v1/admin/tenants
+# Expect 403
+```
+
+### Rollout / rollback guidance
+
+- The corpus is versioned alongside the code; policy changes and matrix updates
+  ship together.
+- Monitor `authz_denied_total` and `authz_corpus_failures_total`; a spike in either
+  after deploy warrants a rollback.
+- Rollback of a policy change is a normal deploy rollback; the corpus re-runs
+  automatically on the rolled-back build.

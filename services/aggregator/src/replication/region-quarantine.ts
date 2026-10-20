@@ -1,11 +1,21 @@
 import { config } from '../infrastructure/config';
 import { DriftReport } from './region-price-replicator';
-import { regionQuarantineState, regionQuarantineTransitionsTotal } from '../observability/metrics';
+import {
+  regionFailbackState,
+  regionFailbackTransitionsTotal,
+  regionPublisherEpoch,
+  regionQuarantineState,
+  regionQuarantineTransitionsTotal,
+} from '../observability/metrics';
 
 export interface RegionQuarantineStatus {
   region: string;
   quarantined: boolean;
   reason?: string;
+  /** Highest publisher epoch observed for this region (local or from peers). */
+  epoch: number;
+  /** True when a newer epoch from a peer has been observed, so this region must not publish. */
+  fenced: boolean;
 }
 
 export type RegionQuarantineTransition = 'quarantined' | 'recovered';
@@ -15,41 +25,70 @@ export interface RegionQuarantineEvaluation extends RegionQuarantineStatus {
 }
 
 /**
- * Per-feed health signal consumed by the quarantine manager. A feed is
- * considered degraded when it is stale (lag beyond the configured threshold)
- * or has a gap in its sequence (missing sequence numbers detected).
+ * Automated failback state machine.
+ *
+ * stable_primary -> failed_over (quarantine engaged)
+ * failed_over -> awaiting_stability (drift back under recover threshold)
+ * awaiting_stability -> reconciling (stability window elapsed with no transitions)
+ * reconciling -> failing_back (CRDT state reconciled)
+ * failing_back -> stable_primary (publisher epoch bumped, authority transferred)
+ *
+ * Any drift above the alert threshold while not stable_primary returns the
+ * machine to failed_over, aborting an in-flight failback.
  */
-export interface FeedHealthSignal {
-  feedId: string;
-  stale: boolean;
-  gapped: boolean;
-  lagMs?: number;
-  missingSequences?: number;
+export type RegionFailbackState =
+  | 'stable_primary'
+  | 'failed_over'
+  | 'awaiting_stability'
+  | 'reconciling'
+  | 'failing_back';
+
+export interface RegionFailbackStatus {
+  region: string;
+  state: RegionFailbackState;
+  publisherEpoch: number;
+  /** Milliseconds the region has been continuously stable, if awaiting stability. */
+  stableForMs: number;
+  lastTransitionAt: number;
 }
 
-export interface FeedQuarantineStatus {
-  feedId: string;
-  quarantined: boolean;
-  reason?: string;
+export interface RegionFailbackEvaluation extends RegionQuarantineEvaluation {
+  failback: RegionFailbackStatus;
+  /** Set when this evaluation transferred publishing authority to this region. */
+  authorityTransferred: boolean;
 }
 
-export interface FeedQuarantineEvaluation extends FeedQuarantineStatus {
-  transition: RegionQuarantineTransition | null;
+export interface CrdtReconciler {
+  /** Reconcile local CRDT state with peers; resolves true when converged. */
+  reconcile(): Promise<boolean>;
 }
 
-export interface RegionQuarantineEvaluationWithFeeds extends RegionQuarantineEvaluation {
-  feeds: FeedQuarantineEvaluation[];
+export interface PublisherEpochStore {
+  /** Atomically bump the publisher epoch and return the new value. */
+  bumpEpoch(expectedEpoch: number): Promise<number>;
+  currentEpoch(): number;
 }
 
 export class RegionQuarantineManager {
   private status: RegionQuarantineStatus = {
     region: config.region.id,
     quarantined: false,
+    epoch: 0,
+    fenced: false,
   };
 
-  private feedStatuses = new Map<string, FeedQuarantineStatus>();
+  private failbackState: RegionFailbackState = 'stable_primary';
+  private publisherEpoch = 0;
+  private stableSince: number | null = null;
+  private lastTransitionAt = Date.now();
+  private failbackInFlight = false;
 
-  evaluate(report: DriftReport, feedSignals: FeedHealthSignal[] = []): RegionQuarantineEvaluationWithFeeds {
+  constructor(
+    private readonly reconciler?: CrdtReconciler,
+    private readonly epochStore?: PublisherEpochStore,
+  ) {}
+
+  async evaluate(report: DriftReport): Promise<RegionFailbackEvaluation> {
     const previous = this.status.quarantined;
     const driftQuarantined = this.nextState(report);
     const feedEvaluations = this.evaluateFeeds(feedSignals);
@@ -71,81 +110,165 @@ export class RegionQuarantineManager {
     }
 
     this.status = quarantined
-      ? { region: config.region.id, quarantined: true, reason }
-      : { region: config.region.id, quarantined: false };
+      ? {
+          region: config.region.id,
+          quarantined: true,
+          reason: previous
+            ? this.status.reason
+            : `drift ${report.maxDriftPercent.toFixed(4)}% exceeds ${config.region.driftAlertPercent}%`,
+          epoch: this.status.epoch,
+          fenced: this.status.fenced,
+        }
+      : {
+          region: config.region.id,
+          quarantined: false,
+          epoch: this.status.epoch,
+          fenced: this.status.fenced,
+        };
 
     regionQuarantineState.set({ region: config.region.id }, quarantined ? 1 : 0);
-    const transition: RegionQuarantineTransition | null =
-      quarantined === previous ? null : quarantined ? 'quarantined' : 'recovered';
-    if (transition) {
+    let transition: RegionQuarantineTransition | null = null;
+    if (quarantined !== previous) {
+      transition = quarantined ? 'quarantined' : 'recovered';
       regionQuarantineTransitionsTotal.inc({ region: config.region.id, to: transition });
     }
 
-    return { ...this.status, transition, feeds: feedEvaluations };
+    const authorityTransferred = await this.advanceFailback(report, quarantined);
+
+    return {
+      ...this.status,
+      transition,
+      failback: this.getFailbackStatus(),
+      authorityTransferred,
+    };
+  }
+
+  /**
+   * Records a publisher epoch observed for this region. If the observed epoch is
+   * higher than the highest epoch seen so far, another publisher has taken over
+   * and the local region is fenced: it must refuse to publish until it observes
+   * its own epoch as the highest again (e.g. after a fresh election).
+   */
+  observeEpoch(epoch: number): RegionQuarantineStatus {
+    if (!Number.isFinite(epoch) || epoch < 0) return this.status;
+
+    if (epoch > this.status.epoch) {
+      this.status = {
+        ...this.status,
+        epoch,
+        fenced: true,
+        reason: this.status.quarantined
+          ? this.status.reason
+          : `observed newer publisher epoch ${epoch}`,
+      };
+    }
+    return this.status;
+  }
+
+  /** True when the local region is allowed to publish (not quarantined and not fenced). */
+  isAuthoritative(): boolean {
+    return !this.status.quarantined && !this.status.fenced;
   }
 
   getStatus(): RegionQuarantineStatus {
     return this.status;
   }
 
-  getFeedStatus(feedId: string): FeedQuarantineStatus | undefined {
-    return this.feedStatuses.get(feedId);
+  getFailbackStatus(): RegionFailbackStatus {
+    const now = Date.now();
+    return {
+      region: config.region.id,
+      state: this.failbackState,
+      publisherEpoch: this.publisherEpoch,
+      stableForMs: this.stableSince === null ? 0 : now - this.stableSince,
+      lastTransitionAt: this.lastTransitionAt,
+    };
   }
 
-  getFeedStatuses(): FeedQuarantineStatus[] {
-    return Array.from(this.feedStatuses.values());
+  private async advanceFailback(report: DriftReport, quarantined: boolean): Promise<boolean> {
+    if (!config.region.failbackEnabled) return false;
+
+    const now = Date.now();
+    const driftAboveAlert = report.maxDriftPercent > config.region.driftAlertPercent;
+    const driftStable =
+      report.driftKnown && report.maxDriftPercent <= config.region.quarantineRecoverPercent;
+
+    // Any regression aborts an in-flight failback and re-enters failed_over.
+    if (quarantined || driftAboveAlert) {
+      this.stableSince = null;
+      if (this.failbackState !== 'failed_over') {
+        this.transitionTo('failed_over', now);
+      }
+      return false;
+    }
+
+    switch (this.failbackState) {
+      case 'stable_primary':
+        return false;
+
+      case 'failed_over': {
+        if (!driftStable) return false;
+        this.stableSince = now;
+        this.transitionTo('awaiting_stability', now);
+        return false;
+      }
+
+      case 'awaiting_stability': {
+        if (!driftStable) {
+          this.stableSince = null;
+          this.transitionTo('failed_over', now);
+          return false;
+        }
+        if (this.stableSince === null) this.stableSince = now;
+        if (now - this.stableSince < config.region.failbackStabilityWindowMs) return false;
+        this.transitionTo('reconciling', now);
+        return this.runReconcileAndFailback(now);
+      }
+
+      case 'reconciling':
+      case 'failing_back':
+        // A concurrent evaluation is already driving the failback.
+        return this.runReconcileAndFailback(now);
+    }
   }
 
-  private evaluateFeeds(feedSignals: FeedHealthSignal[]): FeedQuarantineEvaluation[] {
-    const seen = new Set<string>();
-    const evaluations: FeedQuarantineEvaluation[] = [];
-
-    for (const signal of feedSignals) {
-      seen.add(signal.feedId);
-      const previous = this.feedStatuses.get(signal.feedId)?.quarantined ?? false;
-      const degraded = config.region.quarantineEnabled && (signal.stale || signal.gapped);
-
-      let reason: string | undefined;
-      if (degraded) {
-        const parts: string[] = [];
-        if (signal.stale) {
-          parts.push(
-            signal.lagMs !== undefined
-              ? `lag ${signal.lagMs}ms exceeds threshold`
-              : 'stale',
-          );
+  private async runReconcileAndFailback(now: number): Promise<boolean> {
+    if (this.failbackInFlight) return false;
+    this.failbackInFlight = true;
+    try {
+      if (this.failbackState === 'reconciling') {
+        const converged = this.reconciler ? await this.reconciler.reconcile() : true;
+        if (!converged) {
+          // Stay in reconciling; a later evaluation retries.
+          return false;
         }
-        if (signal.gapped) {
-          parts.push(
-            signal.missingSequences !== undefined
-              ? `missing ${signal.missingSequences} sequence(s)`
-              : 'sequence gap',
-          );
-        }
-        reason = parts.join('; ');
+        this.transitionTo('failing_back', Date.now());
       }
 
-      const status: FeedQuarantineStatus = degraded
-        ? { feedId: signal.feedId, quarantined: true, reason }
-        : { feedId: signal.feedId, quarantined: false };
-      this.feedStatuses.set(signal.feedId, status);
+      // Atomically bump the publisher epoch before transferring authority so
+      // that stale publishers are fenced off and split brain is impossible.
+      const expected = this.epochStore ? this.epochStore.currentEpoch() : this.publisherEpoch;
+      const nextEpoch = this.epochStore
+        ? await this.epochStore.bumpEpoch(expected)
+        : this.publisherEpoch + 1;
+      this.publisherEpoch = nextEpoch;
+      regionPublisherEpoch.set({ region: config.region.id }, nextEpoch);
 
-      const transition: RegionQuarantineTransition | null =
-        degraded === previous ? null : degraded ? 'quarantined' : 'recovered';
-      evaluations.push({ ...status, transition });
+      this.stableSince = null;
+      this.transitionTo('stable_primary', Date.now());
+      return true;
+    } finally {
+      this.failbackInFlight = false;
     }
+  }
 
-    // Feeds that disappear from the signal set are treated as recovered so
-    // stale quarantine state cannot linger indefinitely.
-    for (const [feedId, status] of this.feedStatuses) {
-      if (seen.has(feedId)) continue;
-      this.feedStatuses.set(feedId, { feedId, quarantined: false });
-      if (status.quarantined) {
-        evaluations.push({ feedId, quarantined: false, transition: 'recovered' });
-      }
-    }
-
-    return evaluations;
+  private transitionTo(next: RegionFailbackState, now: number): void {
+    if (this.failbackState === next) return;
+    const from = this.failbackState;
+    this.failbackState = next;
+    this.lastTransitionAt = now;
+    regionFailbackState.set({ region: config.region.id }, failbackStateValue(next));
+    regionFailbackTransitionsTotal.inc({ region: config.region.id, from, to: next });
   }
 
   private nextState(report: DriftReport): boolean {
@@ -156,5 +279,20 @@ export class RegionQuarantineManager {
     const recovered =
       report.driftKnown && report.maxDriftPercent <= config.region.quarantineRecoverPercent;
     return this.status.quarantined && !recovered;
+  }
+}
+
+function failbackStateValue(state: RegionFailbackState): number {
+  switch (state) {
+    case 'stable_primary':
+      return 0;
+    case 'failed_over':
+      return 1;
+    case 'awaiting_stability':
+      return 2;
+    case 'reconciling':
+      return 3;
+    case 'failing_back':
+      return 4;
   }
 }

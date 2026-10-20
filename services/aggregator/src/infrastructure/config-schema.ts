@@ -23,6 +23,7 @@ export class ConfigValidationError extends Error {
 }
 
 const LOG_LEVELS = ['error', 'warn', 'info', 'http', 'verbose', 'debug', 'silly'] as const;
+const BROWNOUT_TIERS = ['none', 'tier1', 'tier2', 'tier3'] as const;
 const ASSET_SYMBOL = /^[A-Z0-9][A-Z0-9:_-]{0,31}$/;
 const REGION_ID = /^[a-z0-9][a-z0-9-]{0,62}$/;
 const HEX_KEY_64 = /^[0-9a-f]{64}$/i;
@@ -262,7 +263,55 @@ const envShape = {
     REGION_QUARANTINE_RECOVER_PERCENT: floatVar(0.05, 0, 100),
     REGION_MAX_REPLICATION_LAG_MS: intVar(5000, 1, 600_000),
 
+    BROWNOUT_TIER: z
+      .enum(BROWNOUT_TIERS, {
+        errorMap: () => ({ message: `expected one of ${BROWNOUT_TIERS.join(', ')}` }),
+      })
+      .default('none'),
+    BROWNOUT_MAX_PRICE_AGE_MS: intVar(120000, 1, 86_400_000),
+    BROWNOUT_SHED_HISTORY: boolVar(false),
+    BROWNOUT_SHED_ARCHIVAL: boolVar(false),
+    BROWNOUT_SHED_NON_CRITICAL_FEEDS: boolVar(false),
+
+    MAINTENANCE_WINDOW_ENABLED: boolVar(false),
+    MAINTENANCE_DRAIN_TIMEOUT_MS: intVar(60000, 1000, 3_600_000),
+    MAINTENANCE_PRECHECK_MAX_STALENESS_MS: intVar(120000, 1, 86_400_000),
+    MAINTENANCE_PRECHECK_MIN_HEALTHY_PEERS: intVar(1, 0, 100),
+    MAINTENANCE_PUBLISHER_FENCING_ENABLED: boolVar(true),
+    MAINTENANCE_POSTCHECK_TIMEOUT_MS: intVar(120000, 1000, 3_600_000),
+
     KAFKA_BROKERS: commaListSchema(
+======>>> REPLACE
+export type RawEnvConfig = z.infer<typeof envSchema>;
+
+export interface CellConfig {
+  /** Cell identifier; `default` preserves single-cell behaviour. */
+  id: string;
+  /** True when CELL_ID was not set and the service runs as the single default cell. */
+  isDefault: boolean;
+  /** Upper-cased asset symbols owned by this cell (empty means all watched assets). */
+  assignedFeeds: string[];
+  /** Per-cell dependency overrides; undefined falls back to the global setting. */
+  dbUrl?: string;
+  cacheUrl?: string;
+  providerUrls: string[];
+}
+
+export const DEFAULT_CELL_ID = 'default';
+
+export function resolveCellConfig(config: RawEnvConfig): CellConfig {
+  const isDefault = config.CELL_ID === undefined;
+  return {
+    id: config.CELL_ID ?? DEFAULT_CELL_ID,
+    isDefault,
+    assignedFeeds: Array.from(
+      new Set((config.CELL_ASSIGNED_FEEDS ?? []).map((feed) => feed.toUpperCase())),
+    ),
+    dbUrl: config.CELL_DB_URL,
+    cacheUrl: config.CELL_CACHE_URL,
+    providerUrls: config.CELL_PROVIDER_URLS ?? [],
+  };
+}
       'KAFKA_BROKERS',
       (entry) => entry.length > 0 && entry.length <= 253 && !/\s/.test(entry),
       'expected a bootstrap broker as host or host:port',
@@ -375,41 +424,40 @@ const envSchema = z.object(envShape).superRefine((value, ctx) => {
         'otherwise a quarantined region can never recover',
     });
   }
-
-  const environment = value.DEPLOYMENT_ENVIRONMENT;
-  const allowlist = value.EGRESS_ALLOWLIST ?? [];
-  const redirectPolicy = value.EGRESS_REDIRECT_POLICY ?? DEFAULT_REDIRECT_POLICY[environment];
-
-  if (environment === 'production' && allowlist.length === 0) {
+  if (value.BROWNOUT_MAX_PRICE_AGE_MS > value.STALENESS_THRESHOLD_MS) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
-      path: ['EGRESS_ALLOWLIST'],
+      path: ['BROWNOUT_MAX_PRICE_AGE_MS'],
       message:
-        'must list at least one host in production (deny-by-default egress would block all providers)',
+        `must be <= STALENESS_THRESHOLD_MS (${value.STALENESS_THRESHOLD_MS}) ` +
+        'otherwise brownout mode can serve prices the normal path would reject',
     });
   }
-
-  if (redirectPolicy === 'allowlist' && allowlist.length === 0) {
+  if (value.MAINTENANCE_PRECHECK_MAX_STALENESS_MS > value.STALENESS_THRESHOLD_MS) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
-      path: ['EGRESS_REDIRECT_POLICY'],
-      message: 'requires a non-empty EGRESS_ALLOWLIST to validate redirect targets',
+      path: ['MAINTENANCE_PRECHECK_MAX_STALENESS_MS'],
+      message:
+        `must be <= STALENESS_THRESHOLD_MS (${value.STALENESS_THRESHOLD_MS}) ` +
+        'otherwise maintenance prechecks accept stale prices',
     });
   }
-
-  if (redirectPolicy === 'deny' && value.EGRESS_MAX_REDIRECTS > 0) {
+  if (value.MAINTENANCE_WINDOW_ENABLED && value.REGION_PEERS.length === 0) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
-      path: ['EGRESS_MAX_REDIRECTS'],
-      message: 'must be 0 when EGRESS_REDIRECT_POLICY is "deny"',
+      path: ['REGION_PEERS'],
+      message:
+        'must list at least one peer when MAINTENANCE_WINDOW_ENABLED is true ' +
+        'so traffic can be drained before maintenance',
     });
   }
-
-  if (value.SSRF_ALLOW_PRIVATE_IPS && environment === 'production') {
+  if (value.MAINTENANCE_WINDOW_ENABLED && value.MAINTENANCE_PRECHECK_MIN_HEALTHY_PEERS === 0) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
-      path: ['SSRF_ALLOW_PRIVATE_IPS'],
-      message: 'must be "false" in production so egress cannot reach private networks',
+      path: ['MAINTENANCE_PRECHECK_MIN_HEALTHY_PEERS'],
+      message:
+        'must be >= 1 when MAINTENANCE_WINDOW_ENABLED is true ' +
+        'so maintenance cannot start without a healthy peer to take over',
     });
   }
 });

@@ -423,4 +423,169 @@ describe('multi-region failover verification', () => {
     const availabilitySloMet = availabilityPercent >= sloAvailabilityPercent;
     expect(availabilitySloMet).toBe(true);
   });
+
+  describe('single-publisher fencing', () => {
+    interface PublisherEpoch {
+      region: string;
+      epoch: number;
+      isLeader: boolean;
+    }
+
+    interface Submission {
+      region: string;
+      epoch: number;
+      price: number;
+      timestamp: number;
+    }
+
+    interface FencedPublisher {
+      currentEpoch: number;
+      leaderRegion: string;
+      acceptedSubmissions: Submission[];
+      rejectedSubmissions: Array<Submission & { reason: string }>;
+    }
+
+    const createPublisher = (leaderRegion: string, currentEpoch: number): FencedPublisher => ({
+      currentEpoch,
+      leaderRegion,
+      acceptedSubmissions: [],
+      rejectedSubmissions: [],
+    });
+
+    const submit = (publisher: FencedPublisher, submission: Submission): boolean => {
+      if (submission.epoch < publisher.currentEpoch) {
+        publisher.rejectedSubmissions.push({ ...submission, reason: 'stale-epoch' });
+        return false;
+      }
+      if (submission.epoch > publisher.currentEpoch) {
+        publisher.rejectedSubmissions.push({ ...submission, reason: 'future-epoch' });
+        return false;
+      }
+      if (submission.region !== publisher.leaderRegion) {
+        publisher.rejectedSubmissions.push({ ...submission, reason: 'not-leader' });
+        return false;
+      }
+      publisher.acceptedSubmissions.push(submission);
+      return true;
+    };
+
+    const promote = (publisher: FencedPublisher, leaderRegion: string, newEpoch: number): void => {
+      expect(newEpoch).toBeGreaterThan(publisher.currentEpoch);
+      publisher.currentEpoch = newEpoch;
+      publisher.leaderRegion = leaderRegion;
+    };
+
+    it('rejects submissions from a partitioned region holding a stale epoch', () => {
+      const publisher = createPublisher('us-east-1', 5);
+      promote(publisher, 'eu-west-1', 6);
+
+      const partitionedRegion: PublisherEpoch = { region: 'us-east-1', epoch: 5, isLeader: false };
+      expect(partitionedRegion.isLeader).toBe(false);
+
+      const staleSubmission: Submission = {
+        region: partitionedRegion.region,
+        epoch: partitionedRegion.epoch,
+        price: 100.75,
+        timestamp: Date.now(),
+      };
+
+      const accepted = submit(publisher, staleSubmission);
+
+      expect(accepted).toBe(false);
+      expect(publisher.acceptedSubmissions).toHaveLength(0);
+      expect(publisher.rejectedSubmissions).toHaveLength(1);
+      expect(publisher.rejectedSubmissions[0].reason).toBe('stale-epoch');
+      expect(publisher.rejectedSubmissions[0].region).toBe('us-east-1');
+    });
+
+    it('requires a restarted region to observe the current epoch before publishing', () => {
+      const persistedEpoch = 7;
+      const publisher = createPublisher('eu-west-1', persistedEpoch);
+
+      const restartedRegion: PublisherEpoch = { region: 'us-east-1', epoch: persistedEpoch - 1, isLeader: false };
+
+      const preObservationSubmission: Submission = {
+        region: restartedRegion.region,
+        epoch: restartedRegion.epoch,
+        price: 101.2,
+        timestamp: Date.now(),
+      };
+
+      expect(submit(publisher, preObservationSubmission)).toBe(false);
+      expect(publisher.rejectedSubmissions[0].reason).toBe('stale-epoch');
+
+      restartedRegion.epoch = publisher.currentEpoch;
+      expect(restartedRegion.epoch).toBe(persistedEpoch);
+
+      const postObservationSubmission: Submission = {
+        region: restartedRegion.region,
+        epoch: restartedRegion.epoch,
+        price: 101.2,
+        timestamp: Date.now(),
+      };
+
+      expect(submit(publisher, postObservationSubmission)).toBe(false);
+      expect(publisher.rejectedSubmissions[1].reason).toBe('not-leader');
+
+      const leaderSubmission: Submission = {
+        region: publisher.leaderRegion,
+        epoch: publisher.currentEpoch,
+        price: 101.2,
+        timestamp: Date.now(),
+      };
+
+      expect(submit(publisher, leaderSubmission)).toBe(true);
+      expect(publisher.acceptedSubmissions).toHaveLength(1);
+    });
+
+    it('accepts only the higher epoch in a split-brain leadership claim', () => {
+      const publisher = createPublisher('us-east-1', 10);
+
+      const claimants: PublisherEpoch[] = [
+        { region: 'us-east-1', epoch: 10, isLeader: true },
+        { region: 'eu-west-1', epoch: 11, isLeader: true },
+      ];
+
+      const highestEpoch = Math.max(...claimants.map((c) => c.epoch));
+      const winner = claimants.find((c) => c.epoch === highestEpoch)!;
+      expect(winner.region).toBe('eu-west-1');
+
+      promote(publisher, winner.region, winner.epoch);
+
+      const results = claimants.map((claimant) =>
+        submit(publisher, {
+          region: claimant.region,
+          epoch: claimant.epoch,
+          price: 102.0,
+          timestamp: Date.now(),
+        }),
+      );
+
+      expect(results).toEqual([false, true]);
+      expect(publisher.acceptedSubmissions).toHaveLength(1);
+      expect(publisher.acceptedSubmissions[0].region).toBe('eu-west-1');
+      expect(publisher.acceptedSubmissions[0].epoch).toBe(11);
+      expect(publisher.rejectedSubmissions).toHaveLength(1);
+      expect(publisher.rejectedSubmissions[0].reason).toBe('stale-epoch');
+
+      const authorityRegions = new Set(publisher.acceptedSubmissions.map((s) => s.region));
+      expect(authorityRegions.size).toBe(1);
+      expect(publisher.leaderRegion).toBe('eu-west-1');
+    });
+
+    it('rejects a future epoch that has not been promoted by the authority', () => {
+      const publisher = createPublisher('us-east-1', 3);
+
+      const speculativeSubmission: Submission = {
+        region: 'us-east-1',
+        epoch: 4,
+        price: 99.5,
+        timestamp: Date.now(),
+      };
+
+      expect(submit(publisher, speculativeSubmission)).toBe(false);
+      expect(publisher.rejectedSubmissions[0].reason).toBe('future-epoch');
+      expect(publisher.currentEpoch).toBe(3);
+    });
+  });
 });

@@ -8,12 +8,15 @@ import { cacheHitTotal, cacheMissTotal, lastPriceTimestamp, priceQueriesTotal } 
 import { v2Ok, v2Fail } from '../infrastructure/response';
 import { sendError } from '../infrastructure/error';
 import { apiKeyManager } from '../governance/api-key-manager';
+import { buildPriceProvenance } from './consumer/price-provenance';
+import { latencyFreshnessMiddleware } from './consumer/latency-freshness';
 
 type PriceConfidence = 'high' | 'medium' | 'low';
 
 type EnrichedPrice = Omit<ApiPrice, 'confidence'> & {
   sourceCount: number;
   confidence: PriceConfidence;
+  consistency: ConsistencyObjective;
 };
 
 function priceConfidence(price: ApiPrice): PriceConfidence {
@@ -21,6 +24,22 @@ function priceConfidence(price: ApiPrice): PriceConfidence {
   if (n >= 3) return 'high';
   if (n >= 2) return 'medium';
   return 'low';
+}
+
+// Live prices are served under the `live_prices` data-product objective. The
+// metadata is attached to every price object so consumers can reason about
+// freshness without knowing the internal thresholds.
+function livePriceConsistency(price: ApiPrice): ConsistencyObjective {
+  return evaluateConsistency('live_prices', price.timestamp);
+}
+
+function enrichPrice(price: ApiPrice): EnrichedPrice {
+  return {
+    ...price,
+    sourceCount: Array.isArray(price.sources) ? price.sources.length : 1,
+    confidence: priceConfidence(price),
+    consistency: livePriceConsistency(price),
+  };
 }
 
 const router = Router();
@@ -31,6 +50,8 @@ export function initializeCacheV2(cache: HybridCache<unknown>): void {
 }
 
 const BATCH_MAX_ASSETS = 50;
+
+router.use(['/prices', '/prices/:asset'], latencyFreshnessMiddleware());
 
 const BatchQuerySchema = z.object({
   assets: z
@@ -61,10 +82,12 @@ router.get('/', (_req: Request, res: Response) => {
     changes: [
       'Response envelope uses `meta` instead of top-level `success`',
       'Price objects include `confidence` and `sourceCount` fields',
+      'Price objects include `consistency` metadata (objective, maxStalenessMs, ageMs, stale)',
       'Pagination supported on /prices and /history via `cursor`',
       'Batch endpoint accepts up to 50 assets',
       'Asset metadata endpoint with filtering by status',
     ],
+    consistencyObjectives: CONSISTENCY_OBJECTIVES,
   });
 });
 
@@ -127,11 +150,7 @@ router.get('/prices', async (req: Request, res: Response) => {
     lastPriceTimestamp.set({ asset: p.asset }, p.timestamp);
   }
 
-  const enriched = result.map((p) => ({
-    ...p,
-    sourceCount: Array.isArray(p.sources) ? p.sources.length : 1,
-    confidence: Array.isArray(p.sources) ? (p.sources.length >= 3 ? 'high' : p.sources.length >= 2 ? 'medium' : 'low') : 'low',
-  }));
+  const enriched = result.map((p) => enrichPrice(p));
 
   const aggregated = {
     timestamp: Math.floor(Date.now() / 1000),
@@ -185,11 +204,7 @@ router.get('/prices/batch', async (req: Request, res: Response) => {
       lastPriceTimestamp.set({ asset }, price.timestamp);
       results.push({
         asset,
-        price: {
-          ...price,
-          sourceCount: Array.isArray(price.sources) ? price.sources.length : 1,
-          confidence: priceConfidence(price),
-        },
+        price: enrichPrice(price),
       });
     } else {
       results.push({ asset, error: 'NOT_FOUND' });
@@ -229,14 +244,41 @@ router.get('/prices/:asset', async (req: Request, res: Response) => {
   priceQueriesTotal.inc({ asset });
   lastPriceTimestamp.set({ asset }, price.timestamp);
 
-  const enriched = {
-    ...price,
-    sourceCount: Array.isArray(price.sources) ? price.sources.length : 1,
-    confidence: priceConfidence(price),
-  };
+  const enriched = enrichPrice(price);
 
   await pricesCache.set(cacheKey, enriched, 'price');
   res.json(v2Ok(enriched));
+});
+
+// GET /prices/:asset/provenance — price-provenance response (#718)
+// Links a price to its catalog version, aggregation policy, source set, and
+// observation-time semantics.
+router.get('/prices/:asset/provenance', async (req: Request, res: Response) => {
+  const asset = req.params.asset.toUpperCase();
+
+  const prices = await readAssetPrices();
+  const price = prices.find((p) => p.asset === asset);
+
+  if (!price) {
+    return res.status(404).json(
+      v2Fail({ code: 'NOT_FOUND', message: `No price data found for asset: ${asset}` }),
+    );
+  }
+
+  const provenance = buildPriceProvenance(
+    {
+      asset: price.asset,
+      price: price.price,
+      decimals: price.decimals,
+      sources: price.sources,
+      timestamp: price.timestamp,
+      observedAt: price.observedAt,
+      fetchedAt: price.fetchedAt,
+    },
+    '/api/v2',
+  );
+
+  res.json(v2Ok(provenance));
 });
 
 router.post('/prices/batch', async (req: Request, res: Response) => {
@@ -267,11 +309,7 @@ router.post('/prices/batch', async (req: Request, res: Response) => {
       lastPriceTimestamp.set({ asset }, price.timestamp);
       results.push({
         asset,
-        price: {
-          ...price,
-          sourceCount: Array.isArray(price.sources) ? price.sources.length : 1,
-          confidence: priceConfidence(price),
-        },
+        price: enrichPrice(price),
       });
     } else {
       results.push({ asset, error: 'NOT_FOUND' });
@@ -315,6 +353,7 @@ router.get('/history/:asset', async (req: Request, res: Response) => {
     from: from || null,
     to: to || null,
     count: history.length,
+    consistency: evaluateConsistency('history', history.length > 0 ? history[history.length - 1].timestamp : undefined),
     prices: history,
   };
 
@@ -338,6 +377,7 @@ router.get('/sources', async (_req: Request, res: Response) => {
       { name: 'Band Protocol', active: true, type: 'off-chain', website: 'https://bandprotocol.com' },
       { name: 'Reflector', active: true, type: 'off-chain', website: 'https://reflector.xyz' },
     ],
+    consistency: evaluateConsistency('catalog'),
   };
 
   await pricesCache.set(cacheKey, data, 'sources');
@@ -372,7 +412,9 @@ router.get('/health', async (req: Request, res: Response) => {
   cacheMissTotal.inc();
 
   const prices = await readAssetPrices();
-  const hasStale = prices.some((p) => Date.now() / 1000 - p.timestamp > 120);
+  const maxStalenessMs = CONSISTENCY_OBJECTIVES.live_prices.maxStalenessMs;
+  const isStale = (p: ApiPrice) => Date.now() - p.timestamp * 1000 > maxStalenessMs;
+  const hasStale = prices.some(isStale);
   const status = prices.length === 0 ? 'unhealthy' : hasStale ? 'degraded' : 'healthy';
 
   const data: Record<string, unknown> = {
@@ -382,7 +424,8 @@ router.get('/health', async (req: Request, res: Response) => {
     uptime: process.uptime(),
     timestamp: Math.floor(Date.now() / 1000),
     assetsTracked: prices.length,
-    degradedAssets: prices.filter((p) => Date.now() / 1000 - p.timestamp > 120).map((p) => p.asset),
+    degradedAssets: prices.filter(isStale).map((p) => p.asset),
+    consistencyObjectives: CONSISTENCY_OBJECTIVES,
   };
 
   if (verbose) {
@@ -390,7 +433,8 @@ router.get('/health', async (req: Request, res: Response) => {
       asset: p.asset,
       timestamp: p.timestamp,
       sources: p.sources,
-      stale: Date.now() / 1000 - p.timestamp > 120,
+      stale: isStale(p),
+      consistency: livePriceConsistency(p),
     }));
     data.processMemoryMb = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
     data.nodeVersion = process.version;
