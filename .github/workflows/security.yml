@@ -22,6 +22,59 @@ jobs:
       - name: Check audit findings table
         run: node scripts/check-audit-findings.js
 
+  tenant-isolation-fuzz:
+    name: Tenant isolation fuzz — caches, REST, GraphQL, WS, exports, jobs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Run tenant isolation fuzz suite
+        env:
+          TENANT_FUZZ_SEED: ${{ github.run_id }}
+          TENANT_FUZZ_ITERATIONS: '500'
+        run: npm run test:tenant-isolation -- --ci --reporters=default --reporters=jest-junit
+
+      - name: Upload fuzz report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tenant-isolation-fuzz-report
+          path: reports/tenant-isolation/
+          retention-days: 30
+
+  authorization-corpus:
+    name: Authorization regression corpus
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Run authorization regression corpus
+        run: npm run test:authz-corpus -- --ci --reporters=default --reporters=jest-junit
+
+      - name: Upload corpus report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: authorization-corpus-report
+          path: reports/authz-corpus/
+          retention-days: 30
+
   codeql:
     name: SAST — CodeQL
     runs-on: ubuntu-latest

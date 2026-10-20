@@ -164,3 +164,79 @@ This program is intake-managed via the email above pending integration with
 a managed bounty platform (e.g. Immunefi, HackerOne). Once integrated, this
 document will be updated with the platform link and this section will note
 the migration.
+
+## Resilience and assurance controls
+
+The controls below are owned by the security and platform teams and are
+exercised in CI. Each entry lists the owner, supported scope, measurable
+completion evidence, monitoring, compatibility, and rollout/rollback
+guidance. Scripts live under `scripts/` and CI jobs under
+`.github/workflows/`.
+
+### Controlled brownout mode (#741)
+
+- **Owner:** Platform on-call (primary), Security (secondary).
+- **Scope:** Partial-service mode that sheds non-critical work (background
+  jobs, non-essential exports, cache warming) while preserving explicit
+  price-freshness and publication guarantees. Applies to `api/` and
+  `services/aggregator/`; does not alter on-chain contract behavior.
+- **Completion evidence:** Brownout state transitions are covered by
+  automated tests (`scripts/test_brownout.*`) exercising normal, boundary
+  (freshness threshold edge), and failure (shed path under load) cases; CI
+  job `brownout` must pass before merge.
+- **Monitoring:** Brownout activation/deactivation events, shed-work
+  counters, and price-freshness gauges are emitted; alerts fire if freshness
+  guarantees are violated while brownout is active.
+- **Compatibility:** Brownout is opt-in via configuration and defaults off;
+  API response shapes are unchanged, only non-critical work is deferred.
+- **Rollout/rollback:** Enable per-region behind a flag, observe freshness
+  and shed counters, then widen. Roll back by disabling the flag; deferred
+  work resumes on the next scheduling cycle.
+
+### Regional maintenance windows (#742)
+
+- **Owner:** Platform on-call.
+- **Scope:** Guarded workflow for planned regional maintenance with
+  prechecks, traffic drain, publisher fencing, and post-maintenance
+  validation. Applies to regional cells of `api/` and
+  `services/aggregator/`.
+- **Completion evidence:** The workflow script (`scripts/maintenance_window.*`)
+  is tested for normal, boundary (drain timeout), and failure (precheck
+  abort, fencing failure) cases; CI job `maintenance-window` must pass.
+- **Monitoring:** Precheck results, drain progress, fencing state, and
+  post-maintenance validation outcomes are logged and alerted on failure.
+- **Compatibility:** Maintenance is region-scoped; other regions continue
+  serving. Publisher fencing prevents split-brain publication during the
+  window.
+- **Rollout/rollback:** Run prechecks in dry-run first, then execute the
+  window. Abort/rollback re-enables traffic and releases fencing; a failed
+  post-check blocks re-enable until resolved.
+
+### Tenant-isolation fuzzing (#747)
+
+- **Owner:** Security.
+- **Scope:** Adversarial tests for tenant separation across caches, REST,
+  GraphQL, WebSockets, exports, and background jobs.
+- **Completion evidence:** Fuzz harness (`scripts/fuzz_tenant_isolation.*`)
+  runs in CI job `tenant-isolation-fuzz` with a fixed seed corpus plus
+  randomized iterations; any cross-tenant leak fails the job.
+- **Monitoring:** Failures surface as CI alerts; production cross-tenant
+  access attempts are logged and alerted.
+- **Compatibility:** Test-only; no runtime behavior change.
+- **Rollout/rollback:** Corpus and seeds are versioned; revert the harness
+  change to roll back. New data paths must add fuzz coverage before merge.
+
+### Authorization regression corpus (#749)
+
+- **Owner:** Security.
+- **Scope:** Versioned matrix of allowed and denied actions across roles,
+  scopes, lifecycle states, and API versions, run in CI.
+- **Completion evidence:** Corpus (`scripts/authz_corpus.*`) is executed by
+  CI job `authz-regression`; every matrix entry must match expected
+  allow/deny outcomes for the job to pass.
+- **Monitoring:** CI failures block merge; drift between corpus and
+  implementation is reported in the job summary.
+- **Compatibility:** Corpus is versioned alongside API versions; entries are
+  added for new roles/scopes/versions without removing historical coverage.
+- **Rollout/rollback:** Add entries incrementally and review diffs; revert
+  the corpus change to roll back. Removing an entry requires security review.

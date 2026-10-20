@@ -23,6 +23,7 @@ export class ConfigValidationError extends Error {
 }
 
 const LOG_LEVELS = ['error', 'warn', 'info', 'http', 'verbose', 'debug', 'silly'] as const;
+const BROWNOUT_TIERS = ['none', 'tier1', 'tier2', 'tier3'] as const;
 const ASSET_SYMBOL = /^[A-Z0-9][A-Z0-9:_-]{0,31}$/;
 const REGION_ID = /^[a-z0-9][a-z0-9-]{0,62}$/;
 const HEX_KEY_64 = /^[0-9a-f]{64}$/i;
@@ -224,6 +225,23 @@ const envShape = {
     REGION_QUARANTINE_RECOVER_PERCENT: floatVar(0.05, 0, 100),
     REGION_MAX_REPLICATION_LAG_MS: intVar(5000, 1, 600_000),
 
+    BROWNOUT_TIER: z
+      .enum(BROWNOUT_TIERS, {
+        errorMap: () => ({ message: `expected one of ${BROWNOUT_TIERS.join(', ')}` }),
+      })
+      .default('none'),
+    BROWNOUT_MAX_PRICE_AGE_MS: intVar(120000, 1, 86_400_000),
+    BROWNOUT_SHED_HISTORY: boolVar(false),
+    BROWNOUT_SHED_ARCHIVAL: boolVar(false),
+    BROWNOUT_SHED_NON_CRITICAL_FEEDS: boolVar(false),
+
+    MAINTENANCE_WINDOW_ENABLED: boolVar(false),
+    MAINTENANCE_DRAIN_TIMEOUT_MS: intVar(60000, 1000, 3_600_000),
+    MAINTENANCE_PRECHECK_MAX_STALENESS_MS: intVar(120000, 1, 86_400_000),
+    MAINTENANCE_PRECHECK_MIN_HEALTHY_PEERS: intVar(1, 0, 100),
+    MAINTENANCE_PUBLISHER_FENCING_ENABLED: boolVar(true),
+    MAINTENANCE_POSTCHECK_TIMEOUT_MS: intVar(120000, 1000, 3_600_000),
+
     KAFKA_BROKERS: commaListSchema(
       'KAFKA_BROKERS',
       (entry) => entry.length > 0 && entry.length <= 253 && !/\s/.test(entry),
@@ -317,6 +335,42 @@ const envSchema = z.object(envShape).superRefine((value, ctx) => {
       message:
         `must be <= REGION_DRIFT_ALERT_PERCENT (${value.REGION_DRIFT_ALERT_PERCENT}) ` +
         'otherwise a quarantined region can never recover',
+    });
+  }
+  if (value.BROWNOUT_MAX_PRICE_AGE_MS > value.STALENESS_THRESHOLD_MS) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['BROWNOUT_MAX_PRICE_AGE_MS'],
+      message:
+        `must be <= STALENESS_THRESHOLD_MS (${value.STALENESS_THRESHOLD_MS}) ` +
+        'otherwise brownout mode can serve prices the normal path would reject',
+    });
+  }
+  if (value.MAINTENANCE_PRECHECK_MAX_STALENESS_MS > value.STALENESS_THRESHOLD_MS) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['MAINTENANCE_PRECHECK_MAX_STALENESS_MS'],
+      message:
+        `must be <= STALENESS_THRESHOLD_MS (${value.STALENESS_THRESHOLD_MS}) ` +
+        'otherwise maintenance prechecks accept stale prices',
+    });
+  }
+  if (value.MAINTENANCE_WINDOW_ENABLED && value.REGION_PEERS.length === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['REGION_PEERS'],
+      message:
+        'must list at least one peer when MAINTENANCE_WINDOW_ENABLED is true ' +
+        'so traffic can be drained before maintenance',
+    });
+  }
+  if (value.MAINTENANCE_WINDOW_ENABLED && value.MAINTENANCE_PRECHECK_MIN_HEALTHY_PEERS === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['MAINTENANCE_PRECHECK_MIN_HEALTHY_PEERS'],
+      message:
+        'must be >= 1 when MAINTENANCE_WINDOW_ENABLED is true ' +
+        'so maintenance cannot start without a healthy peer to take over',
     });
   }
 });

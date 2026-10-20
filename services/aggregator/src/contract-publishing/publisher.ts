@@ -928,19 +928,41 @@ export class ContractPublisher {
       logger.debug('[Publisher] Skipping contract write: publication is suspended');
       return;
     }
+    // Issue #742 — a fenced publisher must not start new writes; the
+    // orchestrator drains and validates before unfencing.
+    if (this.fenced) {
+      logger.warn('[Publisher] Skipping publish round: publisher is fenced', {
+        reason: this.fenceReason,
+        assets: prices.length,
+      });
+      return;
+    }
     this.resetRoundRpcMetrics();
 
-    // Re-read the on-chain canary registration once per publish round
-    await this.refreshCanary();
+    // Issue #741 — critical price publication is always allowed, but the
+    // optional canary refresh is non-critical and is skipped under minimal
+    // brownout to shed RPC load while preserving price freshness.
+    if (this.brownout.isAllowed('canary_refresh')) {
+      // Re-read the on-chain canary registration once per publish round
+      await this.refreshCanary();
+    } else {
+      logger.debug('[Publisher] Brownout: skipping canary refresh (non-critical)');
+    }
 
     // Issue #577 — attempt the Merkle batch path first.
     // One submit_batch transaction commits the root; N apply_batch_entry
     // transactions (one per asset, but far cheaper than full submit_price)
     // apply the individual prices.  Falls back to per-asset submit_price when
     // batch construction or the commit transaction fails.
-    const batchSucceeded = await this.publishViaBatch(prices);
-    if (batchSucceeded) {
-      return;
+    // Issue #741 — under minimal brownout the batch path is shed entirely and
+    // the cheaper per-asset path is used to reduce transaction count.
+    if (this.brownout.isAllowed('batch_publication')) {
+      const batchSucceeded = await this.publishViaBatch(prices);
+      if (batchSucceeded) {
+        return;
+      }
+    } else {
+      logger.warn('[Publisher] Brownout: batch path shed, using per-asset submission');
     }
 
     // Fallback: per-asset submit_price (original behaviour).
@@ -1226,6 +1248,19 @@ export class ContractPublisher {
 
   processRetryQueue(): void {
     if (!this.publishingEnabled) return;
+    // Issue #742 — never flush the retry queue while fenced.
+    if (this.fenced) {
+      logger.debug('[Publisher] Skipping retry processing: publisher is fenced', {
+        reason: this.fenceReason,
+      });
+      return;
+    }
+    // Issue #741 — retry processing is non-critical work; under minimal
+    // brownout it is deferred so RPC capacity is reserved for fresh prices.
+    if (!this.brownout.isAllowed('retry_processing')) {
+      logger.debug('[Publisher] Brownout: deferring retry queue processing');
+      return;
+    }
     const items = this.retryQueue.getQueueItems();
     for (const item of items) {
       this.submitPrice(item.asset, item.price, item.decimals, item.timestamp, item.epoch)
@@ -1274,6 +1309,15 @@ export class ContractPublisher {
       logger.info(`[Publisher] Draining ${items.length} item(s) from retry queue before exit...`);
       for (const item of items) {
         if (!this.publishingEnabled) break;
+        // Issue #742 — stop draining as soon as the publisher is fenced so a
+        // maintenance drain cannot race with a fresh fence.
+        if (this.fenced) {
+          logger.warn('[Publisher] Drain aborted: publisher was fenced mid-drain', {
+            reason: this.fenceReason,
+            remaining: items.length,
+          });
+          break;
+        }
         try {
           const result = await this.submitPrice(
             item.asset,
