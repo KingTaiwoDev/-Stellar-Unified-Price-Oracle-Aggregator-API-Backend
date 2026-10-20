@@ -12,6 +12,7 @@ mod governance;
 mod merkle;
 mod multisig;
 mod proxy;
+pub mod samples;
 pub mod storage;
 mod types;
 mod utils;
