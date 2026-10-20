@@ -32,12 +32,7 @@ import { AggregatedPrice } from '../infrastructure/types';
 import { CanaryRollbackGuard, shouldRouteToCanary } from './canary';
 import { SubmissionRetryQueue } from './retry-queue';
 import { MerkleTree, BatchPriceEntry } from '../infrastructure/merkle';
-import {
-  BrownoutController,
-  BrownoutTier,
-  BrownoutWorkClass,
-  defaultBrownoutController,
-} from './brownout';
+import { FencingEpochStore, FencingEpochState } from './fencing-epoch';
 
 interface ContractCallLog {
   txHash: string;
@@ -264,23 +259,23 @@ export class ContractPublisher {
   private submissionSequence = 0;
   private canaryRollbackGuard: CanaryRollbackGuard;
 
-  // Issue #741 — brownout gating for non-critical publication work.
-  private brownout: BrownoutController;
+  // Issue #745 — single-publisher fencing epoch.  Every submission carries
+  // the epoch this publisher believes is authoritative; the contract rejects
+  // anything below its own epoch, so a stale or isolated region cannot write
+  // after failover.  The epoch is persisted so a restarted process resumes
+  // with the same authority instead of silently regressing.
+  private fencingEpochStore: FencingEpochStore;
+  private fencingEpoch = 0;
 
-  // Issue #742 — publisher fencing state used by the maintenance-window
-  // orchestrator. While fenced, no new contract writes are started and the
-  // retry queue is suspended so a drained cell cannot flush stale writes.
-  private fenced = false;
-  private fenceReason: string | null = null;
-
-  constructor(feePolicy: Partial<FeePolicy> = {}, brownout: BrownoutController = defaultBrownoutController) {
+  constructor(feePolicy: Partial<FeePolicy> = {}, fencingEpochStore?: FencingEpochStore) {
     this.server = new SorobanRpc.Server(config.soroban.rpcUrl);
     this.keypair = Keypair.fromSecret(config.soroban.adminSecret);
     this.contractId = config.soroban.contractId;
     this.networkPassphrase = config.soroban.networkPassphrase;
     this.feePolicy = { ...DEFAULT_FEE_POLICY, ...feePolicy };
     this.canaryRollbackGuard = new CanaryRollbackGuard(config.canary.failureThreshold);
-    this.brownout = brownout;
+    this.fencingEpochStore = fencingEpochStore ?? new FencingEpochStore();
+    this.fencingEpoch = this.fencingEpochStore.load().epoch;
 
     this.retryQueue = new SubmissionRetryQueue({
       maxRetries: 5,
@@ -310,57 +305,60 @@ export class ContractPublisher {
     return this.publishingEnabled;
   }
 
-  // ── Issue #741 — brownout integration ─────────────────────────────────────
-
-  /** Current brownout tier (full | reduced | minimal). */
-  getBrownoutTier(): BrownoutTier {
-    return this.brownout.getTier();
+  /** Issue #745 — the epoch this publisher currently claims authority for. */
+  getFencingEpoch(): number {
+    return this.fencingEpoch;
   }
 
   /**
-   * Whether a unit of work in the given class may run under the current
-   * brownout tier. Critical price publication always returns true so that
-   * freshness/publication guarantees survive any brownout.
+   * Issue #745 — advance the fencing epoch on leader election.
+   *
+   * The new epoch is persisted before it is adopted so a crash mid-promotion
+   * cannot leave the process believing it holds an older epoch than the one
+   * recorded on disk.  Queued submissions from the previous epoch are
+   * discarded: they were produced under authority that is no longer valid and
+   * must be re-aggregated by the new leader rather than replayed.
    */
-  isWorkAllowed(workClass: BrownoutWorkClass): boolean {
-    return this.brownout.isAllowed(workClass);
-  }
-
-  // ── Issue #742 — publisher fencing ────────────────────────────────────────
-
-  /**
-   * Fence the publisher so it stops starting new contract writes. Used by the
-   * maintenance-window orchestrator after traffic drain and before a regional
-   * cell is taken out of service. Idempotent.
-   */
-  fence(reason = 'maintenance'): void {
-    if (this.fenced) return;
-    this.fenced = true;
-    this.fenceReason = reason;
-    this.retryQueue.setSuspended(true, `fenced:${reason}`);
-    logger.warn('[Publisher] Fenced — no new contract writes will be started', {
+  async advanceFencingEpoch(reason = 'leader_election'): Promise<number> {
+    const previous = this.fencingEpoch;
+    const next = previous + 1;
+    const state: FencingEpochState = {
+      epoch: next,
+      updatedAt: Date.now(),
       reason,
-      queued: this.retryQueue.getQueueSize(),
-    });
-  }
+    };
+    this.fencingEpochStore.save(state);
+    this.fencingEpoch = next;
 
-  /** Remove the fence so publication can resume after maintenance. */
-  unfence(reason = 'maintenance-complete'): void {
-    if (!this.fenced) return;
-    this.fenced = false;
-    this.fenceReason = null;
-    if (this.publishingEnabled) {
-      this.retryQueue.setSuspended(false, `unfenced:${reason}`);
+    const discarded = this.retryQueue.getQueueSize();
+    if (discarded > 0) {
+      this.retryQueue.discardAll(`fencing_epoch_advanced:${previous}->${next}`);
     }
-    logger.info('[Publisher] Fence removed — publication may resume', { reason });
+
+    logger.warn('[Publisher] Fencing epoch advanced on leader election', {
+      previousEpoch: previous,
+      epoch: next,
+      reason,
+      discardedSubmissions: discarded,
+    });
+    return next;
   }
 
-  isFenced(): boolean {
-    return this.fenced;
-  }
+  /**
+   * Issue #745 — reject submissions whose epoch is not the current
+   * authoritative epoch.  Returns true when the submission may proceed.
+   */
+  private admitEpoch(epoch: number | undefined, asset: string): boolean {
+    const claimed = epoch ?? this.fencingEpoch;
+    if (claimed === this.fencingEpoch) return true;
 
-  getFenceReason(): string | null {
-    return this.fenceReason;
+    contractSubmissionsTotal.inc({ path: 'fenced', status: 'stale_epoch' });
+    logger.warn('[Publisher] Rejected submission from stale fencing epoch', {
+      asset,
+      claimedEpoch: claimed,
+      currentEpoch: this.fencingEpoch,
+    });
+    return false;
   }
 
   /**
@@ -441,8 +439,9 @@ export class ContractPublisher {
     price: bigint,
     decimals: number,
     timestamp: number,
+    epoch?: number,
   ): Promise<string | null> {
-    return this.submitPriceTo(this.contractId, asset, price, decimals, timestamp);
+    return this.submitPriceTo(this.contractId, asset, price, decimals, timestamp, false, epoch);
   }
 
   /** Send one submission to a specific contract id with bad-sequence recovery */
@@ -453,10 +452,15 @@ export class ContractPublisher {
     decimals: number,
     timestamp: number,
     isRetry = false,
+    epoch?: number,
   ): Promise<string | null> {
+    if (!this.admitEpoch(epoch, asset)) {
+      return null;
+    }
+
     const startMs = Date.now();
     const fnName = 'submit_price';
-    const params = { asset, price: price.toString(), decimals, timestamp };
+    const params = { asset, price: price.toString(), decimals, timestamp, epoch: this.fencingEpoch };
 
     let txHash = '';
     try {
@@ -477,6 +481,7 @@ export class ContractPublisher {
               nativeToScVal(price, { type: 'i128' }),
               nativeToScVal(decimals, { type: 'u32' }),
               nativeToScVal(timestamp, { type: 'u64' }),
+              nativeToScVal(this.fencingEpoch, { type: 'u32' }),
             ],
           }),
         )
@@ -553,7 +558,7 @@ export class ContractPublisher {
         if (!isRetry) {
           logger.warn(`[Contract] tx_bad_seq reported from sendTransaction for ${asset}. Resyncing account and retrying once...`);
           await this.getAccount(true);
-          return this.submitPriceTo(targetContractId, asset, price, decimals, timestamp, true);
+          return this.submitPriceTo(targetContractId, asset, price, decimals, timestamp, true, epoch);
         }
       }
 
@@ -635,7 +640,7 @@ export class ContractPublisher {
           { txHash, contractErrorName },
         );
       } else {
-        this.retryQueue.enqueue({ asset, price, decimals, timestamp });
+        this.retryQueue.enqueue({ asset, price, decimals, timestamp, epoch: this.fencingEpoch });
       }
 
       return null;
@@ -644,7 +649,7 @@ export class ContractPublisher {
         logger.warn(`[Contract] tx_bad_seq exception for ${asset}. Resyncing sequence and retrying once...`);
         try {
           await this.getAccount(true);
-          return this.submitPriceTo(targetContractId, asset, price, decimals, timestamp, true);
+          return this.submitPriceTo(targetContractId, asset, price, decimals, timestamp, true, epoch);
         } catch (resyncErr) {
           logger.error(`[Contract] Failed to resync account after tx_bad_seq: ${resyncErr}`);
         }
@@ -682,6 +687,7 @@ export class ContractPublisher {
           price,
           decimals,
           timestamp,
+          epoch: this.fencingEpoch,
         });
       }
 
@@ -1257,7 +1263,7 @@ export class ContractPublisher {
     }
     const items = this.retryQueue.getQueueItems();
     for (const item of items) {
-      this.submitPrice(item.asset, item.price, item.decimals, item.timestamp)
+      this.submitPrice(item.asset, item.price, item.decimals, item.timestamp, item.epoch)
         .then((result) => {
           if (result) {
             this.retryQueue.remove(`${item.asset}:${item.timestamp}`);
@@ -1279,6 +1285,11 @@ export class ContractPublisher {
 
   getSubmissionSequence(): number {
     return this.submissionSequence;
+  }
+
+  /** Issue #745 — persisted fencing state, for health checks and dashboards. */
+  getFencingEpochState(): FencingEpochState {
+    return this.fencingEpochStore.load();
   }
 
   getConsecutiveFailures(): number {
@@ -1308,7 +1319,13 @@ export class ContractPublisher {
           break;
         }
         try {
-          const result = await this.submitPrice(item.asset, item.price, item.decimals, item.timestamp);
+          const result = await this.submitPrice(
+            item.asset,
+            item.price,
+            item.decimals,
+            item.timestamp,
+            item.epoch,
+          );
           if (result) {
             this.retryQueue.remove(`${item.asset}:${item.timestamp}`);
           }

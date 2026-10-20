@@ -209,6 +209,49 @@ pub struct Unpaused {
     pub proposal_id: u32,
 }
 
+// ── Selective pause / recovery (Issue #731) ───────────────────────────────────
+//
+// Selective pauses are recorded per feed and per write path so operators can
+// pause one component without disabling unrelated write paths. Each state
+// change emits its own event so monitoring can reconstruct exactly which
+// components are paused and which recovery steps have completed.
+
+#[contractevent(data_format = "vec")]
+pub struct FeedPaused {
+    #[topic]
+    pub asset: String,
+    #[topic]
+    pub signer: Address,
+    pub reason: Symbol,
+}
+
+#[contractevent(data_format = "vec")]
+pub struct FeedUnpaused {
+    #[topic]
+    pub asset: String,
+    #[topic]
+    pub signer: Address,
+    pub paused_at: u64,
+}
+
+#[contractevent(data_format = "vec")]
+pub struct WritePathPaused {
+    #[topic]
+    pub path: Symbol,
+    #[topic]
+    pub signer: Address,
+    pub reason: Symbol,
+}
+
+#[contractevent(data_format = "vec")]
+pub struct WritePathUnpaused {
+    #[topic]
+    pub path: Symbol,
+    #[topic]
+    pub signer: Address,
+    pub paused_at: u64,
+}
+
 // ── Admin-config mutations (Issue #564) ────────────────────────────────────────
 
 #[contractevent(data_format = "single-value")]

@@ -2,6 +2,24 @@ import { config } from '../infrastructure/config';
 import { AggregatedPrice } from '../infrastructure/types';
 import { LwwPriceRegister, RegionPriceRecord } from './price-crdt';
 import { propagateForHop, TraceHeaders } from './trace-context';
+import { metrics } from '../infrastructure/metrics';
+
+/**
+ * Fencing epoch carried on every replication record (issue #745). The epoch is
+ * monotonically increasing per region and is bumped on leader election, so a
+ * stale or isolated region that keeps publishing after failover is rejected by
+ * peers because its epoch is older than the last epoch seen for that region.
+ */
+export interface FencedPriceRecord extends Omit<RegionPriceRecord, 'receivedAt' | 'source'> {
+  epoch: number;
+}
+
+export interface StaleEpochRejection {
+  region: string;
+  asset: string;
+  recordEpoch: number;
+  lastSeenEpoch: number;
+}
 
 export interface DriftReport {
   maxDriftPercent: number;
@@ -16,13 +34,87 @@ export interface DriftReport {
 
 export class RegionPriceReplicator {
   private readonly register = new LwwPriceRegister();
+  private epoch: number;
+  private readonly lastSeenEpochByRegion = new Map<string, number>();
+  private readonly staleEpochRejections: StaleEpochRejection[] = [];
 
-  mergeLocalPrices(prices: AggregatedPrice[]): void {
-    this.register.mergeLocal(config.region.id, prices);
+  constructor(initialEpoch = 0) {
+    this.epoch = initialEpoch;
   }
 
-  mergeRemotePrice(record: Omit<RegionPriceRecord, 'receivedAt' | 'source'>): void {
+  /** Current fencing epoch for this region. */
+  getEpoch(): number {
+    return this.epoch;
+  }
+
+  /**
+   * Advance the fencing epoch on leader election. Must be called before the
+   * newly elected leader publishes anything so peers can distinguish its
+   * records from those of the previous (possibly partitioned) leader.
+   */
+  advanceEpochOnLeaderElection(nextEpoch?: number): number {
+    const candidate = nextEpoch ?? this.epoch + 1;
+    if (candidate > this.epoch) {
+      this.epoch = candidate;
+    }
+    return this.epoch;
+  }
+
+  /** Last epoch accepted from `region`, if any. */
+  getLastSeenEpoch(region: string): number | undefined {
+    return this.lastSeenEpochByRegion.get(region);
+  }
+
+  /** Rejections recorded for stale-epoch inbound records. */
+  getStaleEpochRejections(): StaleEpochRejection[] {
+    return [...this.staleEpochRejections];
+  }
+
+  mergeLocalPrices(prices: AggregatedPrice[]): void {
+    this.register.mergeLocal(config.region.id, prices, this.epoch);
+  }
+
+  /**
+   * Merge an inbound remote record. Returns `false` (and records a rejection)
+   * when the record's epoch is older than the last epoch seen for its region,
+   * which fences out stale or isolated publishers after failover.
+   */
+  mergeRemotePrice(record: FencedPriceRecord): boolean {
+    const lastSeen = this.lastSeenEpochByRegion.get(record.region);
+    if (lastSeen !== undefined && record.epoch < lastSeen) {
+      this.staleEpochRejections.push({
+        region: record.region,
+        asset: record.asset,
+        recordEpoch: record.epoch,
+        lastSeenEpoch: lastSeen,
+      });
+      metrics.increment('replication_stale_epoch_rejected_total', {
+        region: record.region,
+      });
+      return false;
+    }
+
+    if (lastSeen === undefined || record.epoch > lastSeen) {
+      this.lastSeenEpochByRegion.set(record.region, record.epoch);
+    }
     this.register.merge({ ...record, receivedAt: Date.now(), source: 'remote' });
+    return true;
+  }
+
+  /**
+   * Build the outbound replication records for this region's latest prices,
+   * stamped with the current fencing epoch.
+   */
+  buildOutboundRecords(): FencedPriceRecord[] {
+    return this.getLocalPrices().map((record) => ({
+      region: record.region,
+      asset: record.asset,
+      price: record.price,
+      timestamp: record.timestamp,
+      epoch: this.epoch,
+      traceparent: record.traceparent,
+      tracestate: record.tracestate,
+    }));
   }
 
   getLatestPrices(): RegionPriceRecord[] {
