@@ -7,6 +7,7 @@ import {
   replicationPublishFailuresTotal,
   replicationRecordsInboundTotal,
   replicationRecordsOutboundTotal,
+  replicationStaleEpochRejectedTotal,
 } from '../observability/metrics';
 
 const RECONNECT_INTERVAL_MS = 30_000;
@@ -28,6 +29,7 @@ interface ReplicationEnvelope {
   timestamp?: unknown;
   traceparent?: unknown;
   tracestate?: unknown;
+  epoch?: unknown;
 }
 
 export class KafkaReplicator {
@@ -113,12 +115,15 @@ export class KafkaReplicator {
       return;
     }
 
+    const epoch = this.replicator.getFencingEpoch();
+
     try {
       const messages = records.map((record) => {
         const trace = this.replicator.outboundTraceHeaders(record.asset);
         const headers: Record<string, string> = {};
         if (trace.traceparent) headers.traceparent = trace.traceparent;
         if (trace.tracestate) headers.tracestate = trace.tracestate;
+        headers.fencingEpoch = String(epoch);
         return {
           key: `${this.kafkaConfig.regionId}:${record.asset}`,
           value: JSON.stringify({
@@ -131,6 +136,7 @@ export class KafkaReplicator {
             wallClock: Date.now(),
             traceparent: trace.traceparent,
             tracestate: trace.tracestate,
+            epoch,
           }),
           headers,
           timestamp: Date.now().toString(),
@@ -168,6 +174,24 @@ export class KafkaReplicator {
         return;
       }
 
+      const epoch =
+        typeof record.epoch === 'number' && Number.isFinite(record.epoch) ? record.epoch : undefined;
+
+      if (epoch !== undefined && this.replicator.isStaleEpoch(record.region, epoch)) {
+        replicationStaleEpochRejectedTotal.inc({
+          region: this.kafkaConfig.regionId,
+          source_region: record.region,
+        });
+        logger.warn('Rejected replicated price with stale fencing epoch', {
+          region: this.kafkaConfig.regionId,
+          sourceRegion: record.region,
+          asset: record.asset,
+          epoch,
+          currentEpoch: this.replicator.getFencingEpoch(),
+        });
+        return;
+      }
+
       const publishedAt = Number(message.timestamp ?? 0);
       if (Number.isFinite(publishedAt) && publishedAt > 0) {
         this.replicationLagMs = Math.max(this.replicationLagMs, Date.now() - publishedAt);
@@ -181,6 +205,7 @@ export class KafkaReplicator {
         timestamp: typeof record.timestamp === 'number' ? record.timestamp : 0,
         traceparent: typeof record.traceparent === 'string' ? record.traceparent : undefined,
         tracestate: typeof record.tracestate === 'string' ? record.tracestate : undefined,
+        epoch,
       });
 
       replicationRecordsInboundTotal.inc({
