@@ -47,10 +47,28 @@ export interface HealthSnapshot {
   onChainHeartbeat?: Record<string, number>;
   // Issue #590 — resolved listen ports (PORT base, PORT+1 WS, PORT+2 HTTP).
   ports?: { base: number; ws: number; http: number };
-  // #736 — cell boundaries and their dependency reachability.
-  cells?: CellStatus[];
-  // #737 — per-feed owner region and current publisher epoch.
-  feedOwnership?: FeedOwnership[];
+  // Issue #741 — controlled brownout state (current tier + shed features).
+  brownout?: BrownoutSnapshot;
+  // Issue #742 — planned maintenance window state (draining / fenced / validating).
+  maintenance?: MaintenanceSnapshot;
+}
+
+export interface BrownoutSnapshot {
+  active: boolean;
+  tier: string;
+  shedFeatures: string[];
+  reason?: string;
+  since?: number;
+}
+
+export interface MaintenanceSnapshot {
+  active: boolean;
+  phase: 'idle' | 'precheck' | 'draining' | 'fenced' | 'validating' | 'complete' | 'aborted';
+  region?: string;
+  startedAt?: number;
+  deadlineAt?: number;
+  publisherFenced: boolean;
+  validationPassed?: boolean;
 }
 
 export class HealthServer {
@@ -98,15 +116,10 @@ export class HealthServer {
         const hasPrices = snap.lastAggregated.length > 0;
         const quarantined = snap.region?.quarantined === true;
         const shuttingDown = snap.shutdownInProgress === true;
-        const globalReady = hasPrices && !quarantined && !shuttingDown && openCircuits.length < Object.keys(snap.sourceHealth).length;
-
-        // #736 — cell-scoped readiness. A degraded cell only affects its own
-        // feeds; the deployment is ready as long as at least one cell is healthy.
-        const cells = snap.cells ?? [];
-        const cellReadiness = cells.map((c) => ({ id: c.id, ready: !c.degraded, reason: c.reason }));
-        const anyCellReady = cells.length === 0 ? globalReady : cells.some((c) => !c.degraded);
-        const ready = globalReady && anyCellReady;
-
+        // #742 — a cell being drained/fenced for maintenance must not receive traffic.
+        const maintenanceActive = snap.maintenance?.active === true;
+        const ready = hasPrices && !quarantined && !shuttingDown && !maintenanceActive
+          && openCircuits.length < Object.keys(snap.sourceHealth).length;
         const code = ready ? 200 : 503;
         res.writeHead(code, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
@@ -116,7 +129,14 @@ export class HealthServer {
           shutdownInProgress: shuttingDown,
           startupTimeMs: snap.startupTimeMs ?? 0,
           openCircuitBreakers: openCircuits.length,
-          cells: cellReadiness,
+          // #741 — brownout is a partial-service mode; readiness stays true but is surfaced.
+          brownout: snap.brownout
+            ? { active: snap.brownout.active, tier: snap.brownout.tier, shedFeatures: snap.brownout.shedFeatures }
+            : { active: false, tier: 'none', shedFeatures: [] },
+          // #742 — maintenance progress for orchestrators.
+          maintenance: snap.maintenance
+            ? { active: snap.maintenance.active, phase: snap.maintenance.phase, publisherFenced: snap.maintenance.publisherFenced }
+            : { active: false, phase: 'idle', publisherFenced: false },
         }));
         return;
       }
@@ -214,15 +234,10 @@ export class HealthServer {
           onChainHeartbeat: snap.onChainHeartbeat || {},
           // #590 — resolved listen ports, so drift is visible at runtime
           ...(snap.ports ? { ports: snap.ports } : {}),
-          // #736 — cell-scoped health so one cell's failure is visible in isolation
-          cells: (snap.cells ?? []).map((c) => ({
-            id: c.id,
-            feeds: c.feeds,
-            degraded: c.degraded,
-            reason: c.reason,
-          })),
-          // #737 — per-feed owner region and publisher epoch
-          feedOwnership: snap.feedOwnership ?? [],
+          // #741 — controlled brownout state
+          brownout: snap.brownout || { active: false, tier: 'none', shedFeatures: [] },
+          // #742 — maintenance window state
+          maintenance: snap.maintenance || { active: false, phase: 'idle', publisherFenced: false },
         };
 
         if (verbose) {

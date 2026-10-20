@@ -321,66 +321,74 @@ export const historyFileWriteFailuresTotal = new client.Counter({
   registers: [register],
 });
 
-// Issue #736 — deployment cell isolation.
-// Each cell is a bounded blast radius: a failure in one cell must not affect
-// feeds or consumers assigned to other cells. cell_health is 1 when the cell
-// is serving normally and 0 when it is degraded or isolated.
-export const cellHealth = new client.Gauge({
-  name: 'cell_health',
-  help: 'Cell health: 1 when the cell is serving normally, 0 when degraded or isolated',
-  labelNames: ['cell'],
+// Issue #741 — controlled brownout mode.
+// The current brownout tier (0 = full service, higher = more shedding) so
+// operators can see at a glance which partial-service mode is active.
+export const brownoutTier = new client.Gauge({
+  name: 'brownout_tier',
+  help: 'Current brownout tier (0 = full service, 1 = light, 2 = heavy shedding)',
   registers: [register],
 });
 
-export const cellAssignedFeeds = new client.Gauge({
-  name: 'cell_assigned_feeds',
-  help: 'Number of feeds currently assigned to the cell',
-  labelNames: ['cell'],
+export const brownoutTierTransitionsTotal = new client.Counter({
+  name: 'brownout_tier_transitions_total',
+  help: 'Number of brownout tier transitions by from/to tier and trigger',
+  labelNames: ['from_tier', 'to_tier', 'trigger'],
   registers: [register],
 });
 
-// Per-dependency health within a cell so a single dependency failure can be
-// attributed to the cells that actually depend on it.
-export const cellDependencyUp = new client.Gauge({
-  name: 'cell_dependency_up',
-  help: 'Dependency reachability from a cell: 1 when up, 0 when down',
-  labelNames: ['cell', 'dependency'],
+// Non-critical work skipped while a brownout tier is active. Price freshness
+// and publication are never shed, so these counters must be the only work
+// dropped during a brownout.
+export const brownoutShedOperationsTotal = new client.Counter({
+  name: 'brownout_shed_operations_total',
+  help: 'Non-critical operations skipped because of brownout shedding, by feature and tier',
+  labelNames: ['feature', 'tier'],
   registers: [register],
 });
 
-// Issue #737 — feed ownership and regional failover.
-// feed_owner_region is 1 for the region that currently owns the feed and 0
-// for all other regions, so exactly one owner is observable per feed.
-export const feedOwnerRegion = new client.Gauge({
-  name: 'feed_owner_region',
-  help: 'Feed ownership by region: 1 for the current owner region, 0 otherwise',
-  labelNames: ['feed', 'region'],
+export const brownoutActiveDurationSeconds = new client.Gauge({
+  name: 'brownout_active_duration_seconds',
+  help: 'Seconds the current brownout tier has been continuously active (0 when full service)',
   registers: [register],
 });
 
-// Monotonically increasing publisher epoch per feed. Every ownership
-// transition must bump the epoch so a stale publisher is detectable.
-export const feedPublisherEpoch = new client.Gauge({
-  name: 'feed_publisher_epoch',
-  help: 'Current publisher epoch for the feed; incremented on every ownership transition',
-  labelNames: ['feed'],
+// Issue #742 — regional maintenance windows.
+// Phase durations let operators verify prechecks, drain, fencing and
+// validation each complete within their budget.
+export const maintenanceWindowPhaseDurationMs = new client.Histogram({
+  name: 'maintenance_window_phase_duration_ms',
+  help: 'Duration of each maintenance window phase in milliseconds',
+  labelNames: ['region', 'phase', 'status'],
+  buckets: [100, 500, 1000, 5000, 10000, 30000, 60000, 120000, 300000, 600000],
   registers: [register],
 });
 
-// Issue #738 — automated controlled failback.
-// failback_state encodes the failback phase per feed:
-// 0=idle, 1=waiting_for_stability, 2=reconciling, 3=transferring, 4=complete, 5=aborted.
-export const failbackState = new client.Gauge({
-  name: 'failback_state',
-  help: 'Failback phase per feed (0=idle,1=waiting_for_stability,2=reconciling,3=transferring,4=complete,5=aborted)',
-  labelNames: ['feed'],
+export const maintenanceWindowPrechecksTotal = new client.Counter({
+  name: 'maintenance_window_prechecks_total',
+  help: 'Maintenance window precheck results by region, check name and outcome (pass|fail)',
+  labelNames: ['region', 'check', 'outcome'],
   registers: [register],
 });
 
-export const failbackStabilitySeconds = new client.Gauge({
-  name: 'failback_stability_seconds',
-  help: 'Seconds the primary region has been continuously healthy while failback waits for stability',
-  labelNames: ['feed'],
+export const maintenanceWindowPostchecksTotal = new client.Counter({
+  name: 'maintenance_window_postchecks_total',
+  help: 'Maintenance window post-maintenance validation results by region, check name and outcome (pass|fail)',
+  labelNames: ['region', 'check', 'outcome'],
+  registers: [register],
+});
+
+export const maintenanceWindowAbortsTotal = new client.Counter({
+  name: 'maintenance_window_aborts_total',
+  help: 'Maintenance windows aborted before completion, by region and reason',
+  labelNames: ['region', 'reason'],
+  registers: [register],
+});
+
+export const maintenanceWindowActive = new client.Gauge({
+  name: 'maintenance_window_active',
+  help: 'Whether a maintenance window is currently active for a region (1) or not (0)',
+  labelNames: ['region'],
   registers: [register],
 });
 

@@ -229,174 +229,168 @@ describe('multi-region failover verification', () => {
     expect(availabilitySloMet).toBe(true);
   });
 
-  describe('deployment cell isolation', () => {
-    interface Cell {
-      id: string;
-      feeds: string[];
-      dependencies: string[];
-      healthy: boolean;
-    }
-
-    const buildCells = (): Cell[] => [
-      { id: 'cell-a', feeds: ['XLM/USD', 'BTC/USD'], dependencies: ['kafka-a', 'db-a'], healthy: true },
-      { id: 'cell-b', feeds: ['ETH/USD', 'USDC/USD'], dependencies: ['kafka-b', 'db-b'], healthy: true },
-      { id: 'cell-c', feeds: ['SOL/USD'], dependencies: ['kafka-c', 'db-c'], healthy: true },
-    ];
-
-    it('degrades only assigned feeds when a cell dependency fails', () => {
-      const cells = buildCells();
-      const failedCell = cells.find((c) => c.id === 'cell-a')!;
-      failedCell.healthy = false;
-
-      const degradedFeeds = cells.filter((c) => !c.healthy).flatMap((c) => c.feeds);
-      const healthyFeeds = cells.filter((c) => c.healthy).flatMap((c) => c.feeds);
-
-      expect(degradedFeeds).toEqual(['XLM/USD', 'BTC/USD']);
-      expect(healthyFeeds).toEqual(['ETH/USD', 'USDC/USD', 'SOL/USD']);
-      expect(healthyFeeds).not.toContain('XLM/USD');
-      expect(cells.filter((c) => c.healthy)).toHaveLength(2);
-    });
-
-    it('bounds blast radius to the failing cell even when all its dependencies fail', () => {
-      const cells = buildCells();
-      const target = cells.find((c) => c.id === 'cell-b')!;
-      target.dependencies = [];
-      target.healthy = false;
-
-      const affectedFeedCount = cells.filter((c) => !c.healthy).flatMap((c) => c.feeds).length;
-      const totalFeedCount = cells.flatMap((c) => c.feeds).length;
-
-      expect(affectedFeedCount).toBeLessThan(totalFeedCount);
-      expect(affectedFeedCount).toBe(2);
-    });
-  });
-
-  describe('per-feed ownership and regional failover rules', () => {
-    interface FeedOwnership {
-      feed: string;
-      primaryRegion: string;
-      failoverRegion: string;
+  describe('single-publisher fencing', () => {
+    interface PublisherEpoch {
+      region: string;
       epoch: number;
-      owner: string;
+      isLeader: boolean;
     }
 
-    const buildOwnership = (): FeedOwnership => ({
-      feed: 'XLM/USD',
-      primaryRegion: 'us-east-1',
-      failoverRegion: 'eu-west-1',
-      epoch: 1,
-      owner: 'us-east-1',
-    });
-
-    const canPublish = (ownership: FeedOwnership, publisherRegion: string, publisherEpoch: number): boolean =>
-      ownership.owner === publisherRegion && ownership.epoch === publisherEpoch;
-
-    it('allows the primary owner to publish in the normal case', () => {
-      const ownership = buildOwnership();
-      expect(canPublish(ownership, 'us-east-1', 1)).toBe(true);
-    });
-
-    it('transfers ownership to failover region at the transition boundary', () => {
-      const ownership = buildOwnership();
-      ownership.owner = ownership.failoverRegion;
-      ownership.epoch += 1;
-
-      expect(canPublish(ownership, 'eu-west-1', 2)).toBe(true);
-      expect(canPublish(ownership, 'us-east-1', 2)).toBe(false);
-    });
-
-    it('rejects publishes from a non-owner region (split-brain prevention)', () => {
-      const ownership = buildOwnership();
-      expect(canPublish(ownership, 'eu-west-1', 1)).toBe(false);
-      expect(canPublish(ownership, 'ap-southeast-1', 1)).toBe(false);
-    });
-
-    it('rejects stale epoch publishes after ownership rollover', () => {
-      const ownership = buildOwnership();
-      ownership.owner = ownership.failoverRegion;
-      ownership.epoch += 1;
-
-      expect(canPublish(ownership, 'eu-west-1', 1)).toBe(false);
-      expect(canPublish(ownership, 'us-east-1', 1)).toBe(false);
-    });
-
-    it('handles epoch rollover boundary without allowing dual authority', () => {
-      const ownership = buildOwnership();
-      ownership.epoch = Number.MAX_SAFE_INTEGER;
-      const nextEpoch = ownership.epoch + 1;
-
-      expect(Number.isSafeInteger(nextEpoch)).toBe(false);
-      expect(canPublish(ownership, 'us-east-1', ownership.epoch)).toBe(true);
-      expect(canPublish(ownership, 'us-east-1', nextEpoch)).toBe(false);
-    });
-  });
-
-  describe('automated controlled regional failback', () => {
-    interface FailbackState {
-      stableForMs: number;
-      requiredStabilityMs: number;
-      primaryState: Record<string, number>;
-      failoverState: Record<string, number>;
-      authorityRegion: string;
+    interface Submission {
+      region: string;
       epoch: number;
+      price: number;
+      timestamp: number;
     }
 
-    const buildFailbackState = (): FailbackState => ({
-      stableForMs: 120000,
-      requiredStabilityMs: 120000,
-      primaryState: { XLM: 100, BTC: 50000 },
-      failoverState: { XLM: 100, BTC: 50000 },
-      authorityRegion: 'eu-west-1',
-      epoch: 2,
+    interface FencedPublisher {
+      currentEpoch: number;
+      leaderRegion: string;
+      acceptedSubmissions: Submission[];
+      rejectedSubmissions: Array<Submission & { reason: string }>;
+    }
+
+    const createPublisher = (leaderRegion: string, currentEpoch: number): FencedPublisher => ({
+      currentEpoch,
+      leaderRegion,
+      acceptedSubmissions: [],
+      rejectedSubmissions: [],
     });
 
-    const isStable = (state: FailbackState): boolean => state.stableForMs >= state.requiredStabilityMs;
-
-    const reconcile = (state: FailbackState): boolean =>
-      Object.keys(state.primaryState).every((k) => state.primaryState[k] === state.failoverState[k]);
-
-    const performFailback = (state: FailbackState): { ok: boolean; reason?: string } => {
-      if (!isStable(state)) return { ok: false, reason: 'stability-not-met' };
-      if (!reconcile(state)) return { ok: false, reason: 'reconciliation-mismatch' };
-      state.authorityRegion = 'us-east-1';
-      state.epoch += 1;
-      return { ok: true };
+    const submit = (publisher: FencedPublisher, submission: Submission): boolean => {
+      if (submission.epoch < publisher.currentEpoch) {
+        publisher.rejectedSubmissions.push({ ...submission, reason: 'stale-epoch' });
+        return false;
+      }
+      if (submission.epoch > publisher.currentEpoch) {
+        publisher.rejectedSubmissions.push({ ...submission, reason: 'future-epoch' });
+        return false;
+      }
+      if (submission.region !== publisher.leaderRegion) {
+        publisher.rejectedSubmissions.push({ ...submission, reason: 'not-leader' });
+        return false;
+      }
+      publisher.acceptedSubmissions.push(submission);
+      return true;
     };
 
-    it('gates failback on stability evidence', () => {
-      const state = buildFailbackState();
-      state.stableForMs = 60000;
-      expect(performFailback(state)).toEqual({ ok: false, reason: 'stability-not-met' });
-      expect(state.authorityRegion).toBe('eu-west-1');
+    const promote = (publisher: FencedPublisher, leaderRegion: string, newEpoch: number): void => {
+      expect(newEpoch).toBeGreaterThan(publisher.currentEpoch);
+      publisher.currentEpoch = newEpoch;
+      publisher.leaderRegion = leaderRegion;
+    };
+
+    it('rejects submissions from a partitioned region holding a stale epoch', () => {
+      const publisher = createPublisher('us-east-1', 5);
+      promote(publisher, 'eu-west-1', 6);
+
+      const partitionedRegion: PublisherEpoch = { region: 'us-east-1', epoch: 5, isLeader: false };
+      expect(partitionedRegion.isLeader).toBe(false);
+
+      const staleSubmission: Submission = {
+        region: partitionedRegion.region,
+        epoch: partitionedRegion.epoch,
+        price: 100.75,
+        timestamp: Date.now(),
+      };
+
+      const accepted = submit(publisher, staleSubmission);
+
+      expect(accepted).toBe(false);
+      expect(publisher.acceptedSubmissions).toHaveLength(0);
+      expect(publisher.rejectedSubmissions).toHaveLength(1);
+      expect(publisher.rejectedSubmissions[0].reason).toBe('stale-epoch');
+      expect(publisher.rejectedSubmissions[0].region).toBe('us-east-1');
     });
 
-    it('proceeds when stability is exactly at the threshold', () => {
-      const state = buildFailbackState();
-      state.stableForMs = state.requiredStabilityMs;
-      expect(isStable(state)).toBe(true);
-      expect(performFailback(state)).toEqual({ ok: true });
+    it('requires a restarted region to observe the current epoch before publishing', () => {
+      const persistedEpoch = 7;
+      const publisher = createPublisher('eu-west-1', persistedEpoch);
+
+      const restartedRegion: PublisherEpoch = { region: 'us-east-1', epoch: persistedEpoch - 1, isLeader: false };
+
+      const preObservationSubmission: Submission = {
+        region: restartedRegion.region,
+        epoch: restartedRegion.epoch,
+        price: 101.2,
+        timestamp: Date.now(),
+      };
+
+      expect(submit(publisher, preObservationSubmission)).toBe(false);
+      expect(publisher.rejectedSubmissions[0].reason).toBe('stale-epoch');
+
+      restartedRegion.epoch = publisher.currentEpoch;
+      expect(restartedRegion.epoch).toBe(persistedEpoch);
+
+      const postObservationSubmission: Submission = {
+        region: restartedRegion.region,
+        epoch: restartedRegion.epoch,
+        price: 101.2,
+        timestamp: Date.now(),
+      };
+
+      expect(submit(publisher, postObservationSubmission)).toBe(false);
+      expect(publisher.rejectedSubmissions[1].reason).toBe('not-leader');
+
+      const leaderSubmission: Submission = {
+        region: publisher.leaderRegion,
+        epoch: publisher.currentEpoch,
+        price: 101.2,
+        timestamp: Date.now(),
+      };
+
+      expect(submit(publisher, leaderSubmission)).toBe(true);
+      expect(publisher.acceptedSubmissions).toHaveLength(1);
     });
 
-    it('aborts failback on reconciliation mismatch', () => {
-      const state = buildFailbackState();
-      state.failoverState.XLM = 101;
-      const result = performFailback(state);
-      expect(result).toEqual({ ok: false, reason: 'reconciliation-mismatch' });
-      expect(state.authorityRegion).toBe('eu-west-1');
-      expect(state.epoch).toBe(2);
+    it('accepts only the higher epoch in a split-brain leadership claim', () => {
+      const publisher = createPublisher('us-east-1', 10);
+
+      const claimants: PublisherEpoch[] = [
+        { region: 'us-east-1', epoch: 10, isLeader: true },
+        { region: 'eu-west-1', epoch: 11, isLeader: true },
+      ];
+
+      const highestEpoch = Math.max(...claimants.map((c) => c.epoch));
+      const winner = claimants.find((c) => c.epoch === highestEpoch)!;
+      expect(winner.region).toBe('eu-west-1');
+
+      promote(publisher, winner.region, winner.epoch);
+
+      const results = claimants.map((claimant) =>
+        submit(publisher, {
+          region: claimant.region,
+          epoch: claimant.epoch,
+          price: 102.0,
+          timestamp: Date.now(),
+        }),
+      );
+
+      expect(results).toEqual([false, true]);
+      expect(publisher.acceptedSubmissions).toHaveLength(1);
+      expect(publisher.acceptedSubmissions[0].region).toBe('eu-west-1');
+      expect(publisher.acceptedSubmissions[0].epoch).toBe(11);
+      expect(publisher.rejectedSubmissions).toHaveLength(1);
+      expect(publisher.rejectedSubmissions[0].reason).toBe('stale-epoch');
+
+      const authorityRegions = new Set(publisher.acceptedSubmissions.map((s) => s.region));
+      expect(authorityRegions.size).toBe(1);
+      expect(publisher.leaderRegion).toBe('eu-west-1');
     });
 
-    it('transfers authority atomically with no split brain', () => {
-      const state = buildFailbackState();
-      const result = performFailback(state);
-      expect(result.ok).toBe(true);
-      expect(state.authorityRegion).toBe('us-east-1');
-      expect(state.epoch).toBe(3);
+    it('rejects a future epoch that has not been promoted by the authority', () => {
+      const publisher = createPublisher('us-east-1', 3);
 
-      const canPublish = (region: string, epoch: number) => state.authorityRegion === region && state.epoch === epoch;
-      expect(canPublish('us-east-1', 3)).toBe(true);
-      expect(canPublish('eu-west-1', 3)).toBe(false);
-      expect(canPublish('us-east-1', 2)).toBe(false);
+      const speculativeSubmission: Submission = {
+        region: 'us-east-1',
+        epoch: 4,
+        price: 99.5,
+        timestamp: Date.now(),
+      };
+
+      expect(submit(publisher, speculativeSubmission)).toBe(false);
+      expect(publisher.rejectedSubmissions[0].reason).toBe('future-epoch');
+      expect(publisher.currentEpoch).toBe(3);
     });
   });
 });

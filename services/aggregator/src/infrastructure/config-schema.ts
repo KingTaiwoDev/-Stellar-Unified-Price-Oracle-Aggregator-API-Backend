@@ -23,6 +23,7 @@ export class ConfigValidationError extends Error {
 }
 
 const LOG_LEVELS = ['error', 'warn', 'info', 'http', 'verbose', 'debug', 'silly'] as const;
+const BROWNOUT_TIERS = ['none', 'tier1', 'tier2', 'tier3'] as const;
 const ASSET_SYMBOL = /^[A-Z0-9][A-Z0-9:_-]{0,31}$/;
 const REGION_ID = /^[a-z0-9][a-z0-9-]{0,62}$/;
 const HEX_KEY_64 = /^[0-9a-f]{64}$/i;
@@ -224,67 +225,25 @@ const envShape = {
     REGION_QUARANTINE_RECOVER_PERCENT: floatVar(0.05, 0, 100),
     REGION_MAX_REPLICATION_LAG_MS: intVar(5000, 1, 600_000),
 
-    CELL_ID: z
-      .string()
-      .optional()
-      .transform((raw, ctx) => {
-        if (raw === undefined || raw.trim() === '') return undefined;
-        const value = raw.trim().toLowerCase();
-        if (!REGION_ID.test(value)) {
-          ctx.addIssue({
-            code: z.ZodIssueCode.custom,
-            message: `"${raw}" is not a valid cell id (lowercase letters, digits and dashes)`,
-          });
-          return z.NEVER;
-        }
-        return value;
-      }),
-    CELL_ASSIGNED_FEEDS: commaListSchema(
-      'CELL_ASSIGNED_FEEDS',
-      (entry) => ASSET_SYMBOL.test(entry.toUpperCase()),
-      'expected an asset symbol (A-Z 0-9 : _ -, max 32 chars)',
-    ),
-    CELL_DB_URL: z
-      .string()
-      .optional()
-      .transform((raw, ctx) => {
-        if (raw === undefined || raw.trim() === '') return undefined;
-        const value = raw.trim();
-        if (!/^postgres(ql)?:\/\/\S+$/.test(value)) {
-          ctx.addIssue({
-            code: z.ZodIssueCode.custom,
-            message: 'expected a postgres:// or postgresql:// connection URL',
-          });
-          return z.NEVER;
-        }
-        return value;
-      }),
-    CELL_CACHE_URL: z
-      .string()
-      .optional()
-      .transform((raw, ctx) => {
-        if (raw === undefined || raw.trim() === '') return undefined;
-        const value = raw.trim();
-        if (!/^(redis|rediss|memcached):\/\/\S+$/.test(value)) {
-          ctx.addIssue({
-            code: z.ZodIssueCode.custom,
-            message: 'expected a redis://, rediss:// or memcached:// URL',
-          });
-          return z.NEVER;
-        }
-        return value;
-      }),
-    CELL_PROVIDER_URLS: commaListSchema(
-      'CELL_PROVIDER_URLS',
-      (entry) => isHttpUrl(entry),
-      'expected an absolute http(s) URL',
-    ),
+    BROWNOUT_TIER: z
+      .enum(BROWNOUT_TIERS, {
+        errorMap: () => ({ message: `expected one of ${BROWNOUT_TIERS.join(', ')}` }),
+      })
+      .default('none'),
+    BROWNOUT_MAX_PRICE_AGE_MS: intVar(120000, 1, 86_400_000),
+    BROWNOUT_SHED_HISTORY: boolVar(false),
+    BROWNOUT_SHED_ARCHIVAL: boolVar(false),
+    BROWNOUT_SHED_NON_CRITICAL_FEEDS: boolVar(false),
+
+    MAINTENANCE_WINDOW_ENABLED: boolVar(false),
+    MAINTENANCE_DRAIN_TIMEOUT_MS: intVar(60000, 1000, 3_600_000),
+    MAINTENANCE_PRECHECK_MAX_STALENESS_MS: intVar(120000, 1, 86_400_000),
+    MAINTENANCE_PRECHECK_MIN_HEALTHY_PEERS: intVar(1, 0, 100),
+    MAINTENANCE_PUBLISHER_FENCING_ENABLED: boolVar(true),
+    MAINTENANCE_POSTCHECK_TIMEOUT_MS: intVar(120000, 1000, 3_600_000),
 
     KAFKA_BROKERS: commaListSchema(
 ======>>> REPLACE
-<<<<<<< SEARCH
-export type RawEnvConfig = z.infer<typeof envSchema>;
-=======
 export type RawEnvConfig = z.infer<typeof envSchema>;
 
 export interface CellConfig {
@@ -409,34 +368,41 @@ const envSchema = z.object(envShape).superRefine((value, ctx) => {
         'otherwise a quarantined region can never recover',
     });
   }
-
-  const hasCellOverrides =
-    value.CELL_DB_URL !== undefined ||
-    value.CELL_CACHE_URL !== undefined ||
-    (value.CELL_PROVIDER_URLS !== undefined && value.CELL_PROVIDER_URLS.length > 0);
-
-  if (value.CELL_ID === undefined) {
-    if (hasCellOverrides || (value.CELL_ASSIGNED_FEEDS?.length ?? 0) > 0) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['CELL_ID'],
-        message:
-          'must be set when CELL_ASSIGNED_FEEDS, CELL_DB_URL, CELL_CACHE_URL or ' +
-          'CELL_PROVIDER_URLS are provided (cell overrides require an explicit cell id)',
-      });
-    }
-    return;
+  if (value.BROWNOUT_MAX_PRICE_AGE_MS > value.STALENESS_THRESHOLD_MS) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['BROWNOUT_MAX_PRICE_AGE_MS'],
+      message:
+        `must be <= STALENESS_THRESHOLD_MS (${value.STALENESS_THRESHOLD_MS}) ` +
+        'otherwise brownout mode can serve prices the normal path would reject',
+    });
   }
-
-  const watched = new Set(value.WATCHED_ASSETS);
-  for (const feed of value.CELL_ASSIGNED_FEEDS ?? []) {
-    if (!watched.has(feed.toUpperCase())) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['CELL_ASSIGNED_FEEDS'],
-        message: `feed "${feed}" is not present in WATCHED_ASSETS`,
-      });
-    }
+  if (value.MAINTENANCE_PRECHECK_MAX_STALENESS_MS > value.STALENESS_THRESHOLD_MS) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['MAINTENANCE_PRECHECK_MAX_STALENESS_MS'],
+      message:
+        `must be <= STALENESS_THRESHOLD_MS (${value.STALENESS_THRESHOLD_MS}) ` +
+        'otherwise maintenance prechecks accept stale prices',
+    });
+  }
+  if (value.MAINTENANCE_WINDOW_ENABLED && value.REGION_PEERS.length === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['REGION_PEERS'],
+      message:
+        'must list at least one peer when MAINTENANCE_WINDOW_ENABLED is true ' +
+        'so traffic can be drained before maintenance',
+    });
+  }
+  if (value.MAINTENANCE_WINDOW_ENABLED && value.MAINTENANCE_PRECHECK_MIN_HEALTHY_PEERS === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['MAINTENANCE_PRECHECK_MIN_HEALTHY_PEERS'],
+      message:
+        'must be >= 1 when MAINTENANCE_WINDOW_ENABLED is true ' +
+        'so maintenance cannot start without a healthy peer to take over',
+    });
   }
 });
 

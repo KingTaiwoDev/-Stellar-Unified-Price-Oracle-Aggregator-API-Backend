@@ -109,32 +109,25 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       maxReplicationLagMs: parsed.REGION_MAX_REPLICATION_LAG_MS,
     },
 
-    // Issue #736 — deployment cells. A cell is the blast-radius boundary for a
-    // single deployment or dependency failure: only the feeds assigned to the
-    // cell (and their consumers) are affected. Configure with:
-    //   CELL_ID                  unique id of this cell (defaults to region id)
-    //   CELL_ASSIGNED_FEEDS      comma-separated assets owned by this cell
-    //                            (defaults to WATCHED_ASSETS)
-    //   CELL_DEPENDENCY_ENDPOINTS comma-separated dependency endpoints
-    //                            (defaults to the configured source base URLs)
-    cell: {
-      id: parsed.CELL_ID ?? regionId,
-      assignedFeeds: parsed.CELL_ASSIGNED_FEEDS.length > 0
-        ? parsed.CELL_ASSIGNED_FEEDS
-        : parsed.WATCHED_ASSETS,
-      dependencyEndpoints: parsed.CELL_DEPENDENCY_ENDPOINTS.length > 0
-        ? parsed.CELL_DEPENDENCY_ENDPOINTS
-        : sourceUrls,
+    // Issue #744 — surge limits applied during failover and recovery so
+    // traffic/cost spikes cannot exhaust provider quotas or budgets before
+    // alerts fire and safe degradation kicks in.
+    surge: {
+      enabled: parsed.SURGE_LIMITS_ENABLED,
+      // Hard ceiling on outbound provider requests per window.
+      maxRequestsPerWindow: parsed.SURGE_MAX_REQUESTS_PER_WINDOW,
+      windowMs: parsed.SURGE_WINDOW_MS,
+      // Fraction of the normal request rate allowed while recovering (0-1).
+      recoveryRateLimit: parsed.SURGE_RECOVERY_RATE_LIMIT,
+      // Estimated cost ceiling (USD) per window before degradation.
+      maxCostPerWindowUsd: parsed.SURGE_MAX_COST_PER_WINDOW_USD,
+      // Estimated per-request cost (USD) used by the cost model.
+      costPerRequestUsd: parsed.SURGE_COST_PER_REQUEST_USD,
+      // Alert thresholds as a fraction of the configured limits (0-1).
+      alertThresholdPercent: parsed.SURGE_ALERT_THRESHOLD_PERCENT,
+      // When limits are exceeded, degrade instead of failing hard.
+      degradeOnLimit: parsed.SURGE_DEGRADE_ON_LIMIT,
     },
-
-    // Issue #737 — explicit per-feed primary/failover region ownership.
-    // Sources, in order of precedence:
-    //   FEED_OWNERSHIP_JSON={"XLM":{"primary":"us-east-1","failover":"eu-west-1"}}
-    //   FEED_PRIMARY_REGION_<ASSET> / FEED_FAILOVER_REGION_<ASSET>
-    //     (e.g. FEED_PRIMARY_REGION_XLM, FEED_FAILOVER_REGION_XLM)
-    // Assets without an explicit entry fall back to the local region for both
-    // primary and failover so a single authorized publisher is always defined.
-    feedOwnership: buildFeedOwnership(parsed, regionId),
   },
 
   assets: (process.env.WATCHED_ASSETS || 'XLM,USDC,BTC,ETH,USDT').split(','),

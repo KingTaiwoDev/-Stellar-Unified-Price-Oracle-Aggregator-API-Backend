@@ -59,81 +59,213 @@ The weekly resilience CronJob additionally verifies `environment=staging` on the
 
 ---
 
-# Rollout and Rollback: Global Operations and Resilience
+## Exiting brownout mode (#741)
 
-This section documents rollout and rollback guidance for the capabilities delivered under the global operations and resilience workstream: deployment cells (#736), feed ownership and regional failover (#737), automated regional failback (#738), and scheduled dependency-failure exercises (#743).
+Brownout mode sheds non-critical work while preserving explicit price freshness and
+publication guarantees. It is controlled by the `BROWNOUT_MODE` flag and the
+`BROWNOUT_SHED` allow-list. Owner: Global Operations and Resilience.
 
-## Compatibility notes
+### When to exit
 
-- **Cell topology (#736)** is additive. Existing single-cell deployments map to a single `cell=default` boundary; no feed or consumer migration is required to adopt cells. Cell labels are optional and default to `default` when absent.
-- **Feed ownership (#737)** introduces an explicit `primary_region`/`failover_region` per feed. Feeds without an ownership record continue to operate in the legacy single-writer mode until an ownership record is published; the migration is backward compatible.
-- **Automated failback (#738)** is gated behind a feature flag (`FAILBACK_AUTOMATION_ENABLED`, default `false`). When disabled, failback remains a manual runbook and no automated authority transfer occurs.
-- **Dependency-failure exercises (#743)** are scheduled only in `staging` by default; enabling them in production requires an explicit override and the pre-flight guard above.
+Exit brownout when the triggering condition has cleared and the following hold for
+at least one full freshness window:
 
-## Monitoring signals
+- `oracle_price_freshness_seconds` is within SLO for every published pair.
+- `oracle_publication_lag_seconds` p99 is back under its threshold.
+- Error budget burn rate is below the page threshold.
 
-| Capability | Signal | Healthy | Alert threshold |
-| --- | --- | --- | --- |
-| Cells (#736) | `cell_blast_radius_feeds` | ≤ cell feed budget | > budget for 5m |
-| Cells (#736) | `cell_consumer_error_rate` | < 1% | > 5% for 10m |
-| Ownership (#737) | `feed_authorized_publishers` | exactly 1 per feed | ≠ 1 for 1m |
-| Ownership (#737) | `feed_owner_region` | matches ownership record | mismatch for 1m |
-| Failback (#738) | `failback_stability_gate` | pass | gate fail blocks transfer |
-| Failback (#738) | `failback_authority_transfers_total` | monotonic, no split brain | > 1 concurrent transfer |
-| Exercises (#743) | `exercise_recovery_seconds` | within SLO | > SLO budget |
-| Exercises (#743) | `exercise_evidence_captured` | 1 per run | 0 for a scheduled run |
+### Rollback steps
 
-## Rollout: deployment cells (#736)
+1. Re-enable shed work incrementally (never all at once):
 
-1. Publish cell boundaries (feed → cell mapping) and verify `cell_blast_radius_feeds` stays within budget.
-2. Deploy cell-scoped aggregator instances; confirm each cell reports `cell_consumer_error_rate` within SLO.
-3. Run a bounded cell-failure exercise (see #743 procedure) to confirm failures stay within the cell.
+   ```bash
+   # Step 1: restore non-critical background jobs
+   kubectl -n stellar-oracle set env deploy/aggregator BROWNOUT_SHED="exports,analytics"
+   # Step 2: restore remaining shed work
+   kubectl -n stellar-oracle set env deploy/aggregator BROWNOUT_SHED=""
+   # Step 3: disable brownout mode entirely
+   kubectl -n stellar-oracle set env deploy/aggregator BROWNOUT_MODE="off"
+   ```
 
-**Rollback a cell deployment:**
+2. If freshness or publication regresses after any step, immediately re-enter
+   brownout by reversing the last step:
 
-```bash
-# Drain a cell and revert to the previous cell assignment
-kubectl -n stellar-oracle scale deploy/aggregator-cell-<cell> --replicas=0
-kubectl -n stellar-oracle label deploy/aggregator-cell-<cell> cell=default --overwrite
-# Restore the previous feed→cell mapping from the last known-good overlay
-kubectl apply -k k8s/overlays/<last-known-good>
-```
+   ```bash
+   kubectl -n stellar-oracle set env deploy/aggregator BROWNOUT_MODE="on"
+   ```
 
-Verify `cell_blast_radius_feeds` returns to baseline and `feed_authorized_publishers` remains exactly 1 per feed.
-
-## Rollout: feed ownership and regional failover (#737)
-
-1. Publish ownership records (`primary_region`, `failover_region`) per feed.
-2. Confirm `feed_owner_region` matches the ownership record and `feed_authorized_publishers` is exactly 1.
-3. Exercise a regional failover in staging and verify a single authorized publisher during the transition.
-
-**Rollback:**
+### Verification
 
 ```bash
-# Revert ownership records to the previous revision
-kubectl apply -k k8s/overlays/<last-known-good>/ownership
+# Confirm flag state
+kubectl -n stellar-oracle get deploy/aggregator -o jsonpath='{.spec.template.spec.containers[0].env}'
+# Confirm freshness and publication metrics recovered
+curl -sf http://localhost:3000/api/v1/health | jq '.brownout'
+curl -sf http://localhost:9090/api/v1/query \
+  --data-urlencode 'query=oracle_price_freshness_seconds' | jq '.data.result'
 ```
 
-If a split-brain is detected (`feed_authorized_publishers` ≠ 1), immediately suspend publishing in the non-authoritative region and follow the escalation steps above.
+### Rollout / rollback guidance
 
-## Automated failback runbook (#738)
+- Roll out brownout flags via the deployment overlay, not ad-hoc `kubectl set env`,
+  in production. The commands above are the emergency path.
+- Monitor `brownout_active`, `oracle_price_freshness_seconds`, and
+  `oracle_publication_lag_seconds` dashboards during both entry and exit.
+- Rollback of a brownout exit is always "re-enter brownout" — it is safe and
+  idempotent.
 
-Failback proceeds only when all stages pass; any failure aborts and leaves authority with the current owner.
+---
 
-1. **Stability gating** — wait for the configured stability window; require `failback_stability_gate=pass` and healthy error/latency SLOs in the target region.
-2. **Reconciliation** — reconcile feed state between regions; require zero unresolved divergence before proceeding.
-3. **Authority transfer** — transfer traffic and publishing authority atomically; verify `feed_authorized_publishers` is exactly 1 throughout and `failback_authority_transfers_total` shows no concurrent transfers.
+## Aborting a regional maintenance window (#742)
 
-**Abort conditions:** stability gate fails, reconciliation divergence remains, or more than one authorized publisher is observed. On abort, authority stays with the current owner and an alert fires.
+Maintenance windows run a guarded workflow: prechecks → traffic drain → publisher
+fencing → maintenance → post-validation. Owner: Global Operations and Resilience.
 
-**Rollback:** set `FAILBACK_AUTOMATION_ENABLED=false` to revert to the manual runbook; the current owner retains authority.
+### Abort at any phase
 
-## Scheduled dependency-failure exercises (#743)
+The maintenance controller exposes an abort endpoint that reverses the current
+phase safely. Abort is idempotent and safe to call from any phase.
 
-Run bounded exercises for database, cache, provider, and network dependencies on the weekly schedule. Each run:
+```bash
+# Abort the named window for a region
+curl -sf -X POST http://localhost:3000/api/v1/maintenance/abort \
+  -H 'content-type: application/json' \
+  -d '{"region":"us-east-1","reason":"operator abort"}'
+```
 
-1. Applies a bounded fault within the staging cell.
-2. Measures `exercise_recovery_seconds` against the SLO budget.
-3. Captures evidence (`exercise_evidence_captured=1`) and records findings in [incident-review.md](incident-review.md).
+If the controller is unreachable, abort manually in reverse phase order:
 
-**Rollback / abort:** use the immediate abort and schedule-suspend procedures above; re-enable once the environment is verified healthy.
+1. **Unfence publishers** (if fenced):
+
+   ```bash
+   kubectl -n stellar-oracle label deploy/publisher \
+     maintenance-fenced- --overwrite
+   ```
+
+2. **Restore traffic** (if drained):
+
+   ```bash
+   kubectl -n stellar-oracle patch service aggregator --type merge \
+     -p '{"spec":{"selector":{"app":"aggregator"}}}'
+   ```
+
+3. **Clear the window record** so the scheduler does not resume a half-run window:
+
+   ```bash
+   kubectl -n stellar-oracle delete configmap maintenance-window-us-east-1 --ignore-not-found
+   ```
+
+### Verification
+
+```bash
+# Window state should be "aborted" or absent
+curl -sf http://localhost:3000/api/v1/maintenance/status?region=us-east-1 | jq
+# Publishers unfenced and serving
+kubectl -n stellar-oracle get deploy/publisher -o jsonpath='{.metadata.labels}'
+# Traffic restored
+kubectl -n stellar-oracle get endpoints aggregator
+# Freshness/publication intact
+curl -sf http://localhost:3000/api/v1/health | jq '.maintenance, .freshness'
+```
+
+### Rollout / rollback guidance
+
+- Enable maintenance automation per-region behind the `MAINTENANCE_AUTOMATION`
+  flag; start with a single canary region.
+- Monitor `maintenance_phase`, `maintenance_aborts_total`, and publisher fencing
+  state during rollout.
+- Rollback of the automation itself: set `MAINTENANCE_AUTOMATION=off`; any
+  in-flight window must be aborted first using the steps above.
+
+---
+
+## Tenant-isolation failure response (#747)
+
+Adversarial tenant-isolation tests run in CI across caches, REST, GraphQL,
+WebSockets, exports, and background jobs. A failure means a tenant boundary may be
+crossable. Owner: Security and Privacy Assurance.
+
+### Immediate response
+
+1. **Treat as a potential data-exposure incident.** Page the on-call security
+   engineer and open an incident.
+2. **Contain** by disabling the affected shared path if it can be isolated:
+
+   ```bash
+   # Example: disable cross-tenant export path
+   kubectl -n stellar-oracle set env deploy/api TENANT_EXPORTS_ENABLED="false"
+   ```
+
+3. **Preserve evidence** — capture the failing test seed and request trace:
+
+   ```bash
+   pnpm test:fuzz:tenant -- --seed "$FAILING_SEED" --repro > tenant-repro.log
+   ```
+
+### Rollback steps
+
+- If the regression was introduced by a recent deploy, roll back to the last
+  known-good image:
+
+  ```bash
+  kubectl -n stellar-oracle rollout undo deploy/api
+  kubectl -n stellar-oracle rollout status deploy/api
+  ```
+
+- Re-enable any contained path only after the fix is verified by the fuzz suite.
+
+### Verification
+
+```bash
+# Full tenant-isolation fuzz suite must pass
+pnpm test:fuzz:tenant
+# Confirm no cross-tenant cache keys leaked
+curl -sf http://localhost:3000/api/v1/health | jq '.tenant_isolation'
+```
+
+---
+
+## Authorization regression failure response (#749)
+
+The authorization regression corpus is a versioned matrix of allowed/denied
+actions across roles, scopes, lifecycle states, and API versions, run in CI. A
+failure means an action's allow/deny outcome changed unexpectedly. Owner: Security
+and Privacy Assurance.
+
+### Immediate response
+
+1. **Do not merge** the change that broke the corpus. The CI gate blocks it.
+2. Determine whether the change is an **intended** policy change or a **regression**:
+   - Intended: update the corpus matrix in the same PR with reviewer sign-off.
+   - Regression: revert the offending change.
+
+### Rollback steps
+
+```bash
+# Revert the offending commit (or roll back the deploy)
+git revert <offending-sha>
+# If already deployed:
+kubectl -n stellar-oracle rollout undo deploy/api
+kubectl -n stellar-oracle rollout status deploy/api
+```
+
+### Verification
+
+```bash
+# Corpus must pass against the running build
+pnpm test:authz:corpus
+# Spot-check a denied action is still denied
+curl -sf -o /dev/null -w '%{http_code}\n' \
+  -H 'authorization: Bearer <low-scope-token>' \
+  http://localhost:3000/api/v1/admin/tenants
+# Expect 403
+```
+
+### Rollout / rollback guidance
+
+- The corpus is versioned alongside the code; policy changes and matrix updates
+  ship together.
+- Monitor `authz_denied_total` and `authz_corpus_failures_total`; a spike in either
+  after deploy warrants a rollback.
+- Rollback of a policy change is a normal deploy rollback; the corpus re-runs
+  automatically on the rolled-back build.

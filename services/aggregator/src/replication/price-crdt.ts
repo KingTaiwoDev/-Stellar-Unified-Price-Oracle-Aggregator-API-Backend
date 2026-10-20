@@ -9,92 +9,74 @@ export interface RegionPriceRecord {
   receivedAt: number;
   source: 'local' | 'remote';
   /**
-   * Monotonically increasing publisher epoch for the feed (issue #737/#738).
-   * Each ownership transfer (failover or failback) increments the epoch so
-   * stale publishers can be rejected during transitions.
+   * Monotonic publisher epoch (fencing token) for the originating region
+   * (issue #745). Each leader election advances the epoch; records stamped
+   * with an epoch lower than the highest epoch observed for a region are
+   * rejected as coming from a stale or isolated publisher.
    */
-  epoch?: number;
-  /** Region currently authorized to publish the feed. */
-  ownerRegion?: string;
+  epoch: number;
   /** W3C trace context carried across the replication bus (issue #419). */
   traceparent?: string;
   tracestate?: string;
 }
 
-/**
- * Ownership metadata for a feed (asset) used to enforce a single authorized
- * publisher during failover/failback transitions (issue #737/#738).
- */
-export interface FeedOwnership {
+export interface StaleEpochRejection {
+  region: string;
   asset: string;
-  /** Region currently authorized to publish. */
-  ownerRegion: string;
-  /** Ordered list of regions eligible to take over, primary first. */
-  failoverRegions: string[];
-  /** Current publisher epoch; incremented on every authority transfer. */
-  epoch: number;
+  recordEpoch: number;
+  currentEpoch: number;
+  timestamp: number;
 }
 
-export type MergeOutcome = 'applied' | 'stale' | 'not-owner' | 'stale-epoch';
+export interface LwwPriceRegisterOptions {
+  /**
+   * Persistence hook for the local publisher epoch. Called whenever the
+   * local epoch advances so the value survives process restarts. Must be
+   * durable before the new epoch is used to stamp outbound records.
+   */
+  persistEpoch?: (region: string, epoch: number) => void | Promise<void>;
+  /** Clock override for deterministic tests. */
+  now?: () => number;
+}
 
 export class LwwPriceRegister {
   private values = new Map<string, RegionPriceRecord>();
-  private ownership = new Map<string, FeedOwnership>();
+  /** Highest publisher epoch observed per region (fencing token). */
+  private epochs = new Map<string, number>();
+  /** Epoch this node is currently authorised to publish with, per region. */
+  private localEpochs = new Map<string, number>();
+  private rejectedStaleEpochs = 0;
+  private lastRejection: StaleEpochRejection | null = null;
+  private readonly persistEpoch?: (region: string, epoch: number) => void | Promise<void>;
+  private readonly now: () => number;
 
-  /**
-   * Declare or update ownership metadata for a feed. Increments the epoch when
-   * the owner changes so that records from the previous owner become stale.
-   */
-  setOwnership(ownership: FeedOwnership): void {
-    const current = this.ownership.get(ownership.asset);
-    if (current && current.ownerRegion === ownership.ownerRegion && ownership.epoch <= current.epoch) {
-      // Same owner: keep the highest epoch seen.
-      this.ownership.set(ownership.asset, { ...ownership, epoch: current.epoch });
-      return;
-    }
-    this.ownership.set(ownership.asset, { ...ownership });
-  }
-
-  /**
-   * Transfer publishing authority for a feed to a new region, incrementing the
-   * epoch. Used by failover/failback procedures to prevent split brain.
-   */
-  transferOwnership(asset: string, newOwnerRegion: string, failoverRegions?: string[]): FeedOwnership {
-    const current = this.ownership.get(asset);
-    const next: FeedOwnership = {
-      asset,
-      ownerRegion: newOwnerRegion,
-      failoverRegions: failoverRegions ?? current?.failoverRegions ?? [],
-      epoch: (current?.epoch ?? 0) + 1,
-    };
-    this.ownership.set(asset, next);
-    return next;
-  }
-
-  getOwnership(asset: string): FeedOwnership | null {
-    return this.ownership.get(asset) ?? null;
+  constructor(options: LwwPriceRegisterOptions = {}) {
+    this.persistEpoch = options.persistEpoch;
+    this.now = options.now ?? Date.now;
   }
 
   /**
    * Merge a price record using last-writer-wins semantics.
    * The record with the greatest timestamp wins.
    *
-   * When ownership metadata exists for the asset, records from a non-owner
-   * region or carrying a stale epoch are rejected to prevent split-brain
-   * writes during failover/failback transitions (issue #737/#738).
+   * Records from a stale publisher (epoch lower than the highest epoch seen
+   * for that region) are rejected outright and never mutate the register.
    */
-  merge(record: RegionPriceRecord): MergeOutcome {
-    const ownership = this.ownership.get(record.asset);
-    if (ownership) {
-      if (record.ownerRegion !== undefined && record.ownerRegion !== ownership.ownerRegion) {
-        return 'not-owner';
-      }
-      if (record.region !== ownership.ownerRegion) {
-        return 'not-owner';
-      }
-      if (record.epoch !== undefined && record.epoch < ownership.epoch) {
-        return 'stale-epoch';
-      }
+  merge(record: RegionPriceRecord): boolean {
+    const currentEpoch = this.epochs.get(record.region) ?? 0;
+    if (record.epoch < currentEpoch) {
+      this.rejectedStaleEpochs += 1;
+      this.lastRejection = {
+        region: record.region,
+        asset: record.asset,
+        recordEpoch: record.epoch,
+        currentEpoch,
+        timestamp: this.now(),
+      };
+      return false;
+    }
+    if (record.epoch > currentEpoch) {
+      this.epochs.set(record.region, record.epoch);
     }
 
     const key = `${record.region}:${record.asset}`;
@@ -105,14 +87,15 @@ export class LwwPriceRegister {
       this.values.set(key, record);
       return 'applied';
     }
-    return 'stale';
+    return true;
   }
 
   /**
-   * Merge local prices into the register. Records are stamped with the current
-   * ownership epoch (if any) so remote peers can validate authority.
+   * Merge local prices into the register, stamping them with the current
+   * local publisher epoch for the region.
    */
   mergeLocal(region: string, prices: AggregatedPrice[], now = Date.now()): void {
+    const epoch = this.currentEpoch(region);
     for (const price of prices) {
       const ownership = this.ownership.get(price.asset);
       this.merge({
@@ -123,10 +106,67 @@ export class LwwPriceRegister {
         timestamp: price.timestamp,
         receivedAt: now,
         source: 'local',
-        epoch: ownership?.epoch,
-        ownerRegion: ownership?.ownerRegion,
+        epoch,
       });
     }
+  }
+
+  /**
+   * Return the highest publisher epoch observed for a region.
+   */
+  epochFor(region: string): number {
+    return this.epochs.get(region) ?? 0;
+  }
+
+  /**
+   * Return the epoch this node is authorised to publish with for a region.
+   * Defaults to the highest observed epoch so a node that has not yet been
+   * promoted cannot publish with a lower token.
+   */
+  currentEpoch(region: string): number {
+    return Math.max(this.localEpochs.get(region) ?? 0, this.epochs.get(region) ?? 0);
+  }
+
+  /**
+   * Advance the local publisher epoch for a region, e.g. on leader election.
+   * The epoch is strictly monotonic: the new value is always greater than
+   * both the previously persisted local epoch and the highest epoch observed
+   * from any publisher. The value is persisted (if a hook is configured)
+   * before it is used to stamp outbound records.
+   */
+  async advanceEpoch(region: string, proposed?: number): Promise<number> {
+    const floor = this.currentEpoch(region);
+    const next = proposed !== undefined ? Math.max(proposed, floor + 1) : floor + 1;
+    if (this.persistEpoch) {
+      await this.persistEpoch(region, next);
+    }
+    this.localEpochs.set(region, next);
+    this.epochs.set(region, next);
+    return next;
+  }
+
+  /**
+   * Restore a persisted local epoch on startup. Never lowers the epoch.
+   */
+  restoreEpoch(region: string, persisted: number): void {
+    if (persisted > this.currentEpoch(region)) {
+      this.localEpochs.set(region, persisted);
+      this.epochs.set(region, persisted);
+    }
+  }
+
+  /**
+   * Number of merges rejected because they carried a stale epoch.
+   */
+  staleEpochRejections(): number {
+    return this.rejectedStaleEpochs;
+  }
+
+  /**
+   * Details of the most recent stale-epoch rejection, for diagnostics.
+   */
+  lastStaleEpochRejection(): StaleEpochRejection | null {
+    return this.lastRejection;
   }
 
   /**
@@ -172,7 +212,8 @@ export class LwwPriceRegister {
   }
 
   /**
-   * Clear all stored records
+   * Clear all stored records. Publisher epochs are retained so that a
+   * restart or cache flush cannot resurrect a stale publisher.
    */
   clear(): void {
     this.values.clear();
